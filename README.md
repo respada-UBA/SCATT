@@ -1,2 +1,2 @@
-# SCATT_OligoDesign
-Oligonucleotide pool design for DNA library mutagenesis
+# SCATT: Stoichiometric Combinatorial Assembly on Transient Template
+This code complements our publication XXX. 
