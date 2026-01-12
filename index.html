@@ -19,7 +19,7 @@
 
     <section class="panel">
       <h2>Input DNA & ORF</h2>
-      <label for="input_sequence">Full DNA sequence (single line or multi-line):</label>
+      <label for="input_sequence">Full DNA sequence (extend beyond the first mutation):</label>
       <textarea id="input_sequence" rows="4"></textarea>
 
       <div class="grid-3">
@@ -309,10 +309,10 @@ def generate_primers(*args):
         ov3 = last_mutation_dna_pos + 2 + primer_overhang_3
 
         if ov5 < 1:
-            show_status(f'First primer overhang extends before start of sequence (ov5={ov5}).', error=True)
+            show_status(f'First primer overhang extends before start of sequence ({ov5} bases).', error=True)
             return
         if ov3 > l_input:
-            show_status(f'Last primer overhang extends beyond sequence length (ov3={ov3}, len={l_input}).', error=True)
+            show_status(f'Last primer overhang extends beyond sequence length (to position {ov3}).', error=True)
             return
 
         # generate primers list (without pandas)
