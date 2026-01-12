@@ -65,6 +65,9 @@
         <pre id="translated"></pre>
       </div>
 
+      <!-- inside the actions section, e.g. next to Generate / Clear -->
+        <button id="download" py-click="download_csv" disabled>Download CSV</button>
+
       <div>
         <strong>Primers:</strong>
         <div id="table_container"></div>
@@ -77,6 +80,8 @@ from js import document
 from js import console
 import random
 import re
+
+PRIMERS = []   # global store for the last generated primers
 
 genetic_code = {
     'GCT': 'A', 'GCC': 'A', 'GCA': 'A', 'GCG': 'A',
@@ -146,7 +151,14 @@ def show_status(msg, error=False):
 def clear_all(*args):
     document.getElementById('translated').innerText = ''
     document.getElementById('table_container').innerHTML = ''
+    try:
+        document.getElementById('download').disabled = True
+    except Exception:
+        pass
+        # also clear PRIMERS
+        PRIMERS = []
     show_status('Cleared.')
+
 
 def parse_positions_list(text):
     text = text.strip()
@@ -186,7 +198,43 @@ def generate_table_html(rows):
     html.append('</tbody></table>') 
     return ''.join(html)
 
+# CSV download helper
+import io
+import csv
+from js import Blob, URL
 
+def download_csv(*args):
+    try:
+        global PRIMERS
+        if not PRIMERS:
+            show_status("No primers to download.", error=True)
+            return
+
+        # Build CSV in-memory
+        sio = io.StringIO()
+        writer = csv.writer(sio)
+        writer.writerow(["primer_name", "primer_sequence"])
+        for p in PRIMERS:
+            writer.writerow([p.get("primer_name", ""), p.get("primer_sequence", "")])
+        csv_text = sio.getvalue()
+
+        # Create a Blob and a temporary anchor to download it
+        blob = Blob.new([csv_text], { "type": "text/csv;charset=utf-8;" })
+        url = URL.createObjectURL(blob)
+        a = document.createElement("a")
+        a.href = url
+        a.download = "primers_scatt.csv"
+        # Append to DOM, click, then remove
+        document.body.appendChild(a)
+        a.click()
+        a.remove()
+        URL.revokeObjectURL(url)
+
+        show_status("CSV download started.")
+    except Exception as e:
+        console.error("download_csv error:", e)
+        show_status("CSV download failed. Check console.", error=True)
+        
 def generate_primers(*args):
     try:
         # collect inputs
@@ -314,6 +362,14 @@ def generate_primers(*args):
         show_status(f'Generated {len(primers)} primers.')
     except Exception as e:
         show_status(f'Error: {str(e)}', error=True)
+    global PRIMERS
+    PRIMERS = primers
+    # enable the download button (JS DOM)
+    try:
+        document.getElementById('download').disabled = False
+    except Exception:
+        pass
+
 
 # wire mutation_type selector to show/hide options
 def on_mutation_type_change(*_):
