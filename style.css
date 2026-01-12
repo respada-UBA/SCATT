@@ -1,0 +1,44 @@
+:root{
+  --card:#ffffff;
+  --muted:#617;
+  --bg:#f3f6fb;
+  --accent:#0b5;
+}
+*{box-sizing:border-box}
+body{
+  margin:0;
+  font-family:Inter, Roboto, Arial, sans-serif;
+  background: linear-gradient(180deg,#eef7ff,#f9fafb);
+  padding:20px;
+  display:flex;
+  justify-content:center;
+}
+.container{
+  width:920px;
+  max-width:95%;
+}
+h1{margin:0 0 12px 0}
+.panel{
+  background:var(--card);
+  border-radius:10px;
+  padding:14px;
+  box-shadow:0 6px 20px rgba(17,24,39,0.06);
+  margin-bottom:12px;
+}
+label{display:block;margin:8px 0;font-size:14px}
+input[type="text"], input[type="number"], textarea, select{
+  padding:8px 10px;border-radius:6px;border:1px solid #e6e9ef;width:100%;
+}
+.grid-3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-top:8px}
+.actions{display:flex;gap:10px;align-items:center}
+button{background:#0b5;color:white;border:none;padding:8px 12px;border-radius:8px;cursor:pointer}
+button#clear{background:#777}
+.status{margin-left:8px;font-weight:600}
+pre{background:#fbfdff;padding:10px;border-radius:6px;overflow:auto}
+.result-table{width:100%;border-collapse:collapse;margin-top:8px}
+.result-table th, .result-table td{border:1px solid #eee;padding:6px 8px;text-align:left}
+code{font-family:monospace;background:#f7f7f9;padding:2px 6px;border-radius:4px}
+@media (max-width:720px){
+  .grid-3{grid-template-columns:1fr}
+  .container{padding:8px}
+}
