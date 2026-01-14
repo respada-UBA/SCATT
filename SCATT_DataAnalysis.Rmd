@@ -1,0 +1,1695 @@
+---
+title: "SCATT - Data analysis"
+css: styleR.css
+df_print: kable
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_collapsed: true    
+    number_sections: true
+    code_folding: "hide"
+---
+
+SCATT (Stoichiometric Combinatorial Assembly on Transient Template) is an accessible strategy for constructing mutagenic libraries. Inspired by previous template-mediated assembly methods, SCATT allows the creation of user-tailored libraries via a simple experimental pipeline while tightly controlling the average number of mutations. 
+
+This notebook contains the analysis of our data. 
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE,warning = FALSE, eval=TRUE)
+```
+
+```{r Packages}
+suppressMessages(require(Biostrings,quietly = T,warn.conflicts = F))
+
+suppressMessages(library(Rsamtools))
+suppressMessages(library(GenomicAlignments))
+suppressMessages(library(GenomicRanges))
+
+suppressMessages(require(stringr,quietly = T))
+suppressMessages(require(stringdist,quietly = T))
+suppressMessages(require(fastcluster,quietly = T))
+
+suppressMessages(require(dplyr,quietly = T))
+suppressMessages(require(tidyr))
+
+suppressMessages(require(ggplot2,quietly = T))
+suppressMessages(require(ggpubr,quietly = T))
+suppressMessages(require(scales,quietly = T))
+suppressMessages(require(plotly))
+suppressMessages(library(ggpointdensity))
+
+suppressMessages(require(DescTools))
+suppressMessages(library(purrr))
+suppressMessages(library(tibble))
+suppressMessages(require(broom))
+
+suppressMessages(require(Rcpp))
+options(dplyr.summarise.inform = FALSE) 
+
+theme_pub <- theme_classic() + theme(
+    text = element_text(size = 10),         # overall text
+    axis.title = element_text(size = 10),   # axis labels
+    axis.text = element_text(size = 10),    # tick labels
+    legend.text = element_text(size = 10),  # legend labels
+    legend.title = element_text(size = 10), # legend title
+    plot.title = element_text(size = 10)    # plot title
+  )
+theme_set(theme_pub)
+
+```
+
+```{r Functions}
+# Compare sequences fast
+comp.very.fast <- function(x,y,shift=0){
+  ref <- c(as.matrix(x))
+  query <- c(as.matrix(y))
+  ind <- which( ref  != query )
+  
+  return(paste0(ref[ind],ind+shift,query[ind]))
+}
+
+revcomp_string <- function(x) {
+    as.character(reverseComplement(DNAString(x)))
+}
+
+
+#dictionary codon to amino acid
+codon_to_aa <- c(
+  "ATA" = "I", "ATC" = "I", "ATT" = "I", "ATG" = "M",
+  "ACA" = "T", "ACC" = "T", "ACG" = "T", "ACT" = "T",
+  "AAC" = "N", "AAT" = "N", "AAA" = "K", "AAG" = "K",
+  "AGC" = "S", "AGT" = "S", "AGA" = "R", "AGG" = "R",
+  "CTA" = "L", "CTC" = "L", "CTG" = "L", "CTT" = "L",
+  "CCA" = "P", "CCC" = "P", "CCG" = "P", "CCT" = "P",
+  "CAC" = "H", "CAT" = "H", "CAA" = "Q", "CAG" = "Q",
+  "CGA" = "R", "CGC" = "R", "CGG" = "R", "CGT" = "R",
+  "GTA" = "V", "GTC" = "V", "GTG" = "V", "GTT" = "V",
+  "GCA" = "A", "GCC" = "A", "GCG" = "A", "GCT" = "A",
+  "GAC" = "D", "GAT" = "D", "GAA" = "E", "GAG" = "E",
+  "GGA" = "G", "GGC" = "G", "GGG" = "G", "GGT" = "G",
+  "TCA" = "S", "TCC" = "S", "TCG" = "S", "TCT" = "S",
+  "TTC" = "F", "TTT" = "F", "TTA" = "L", "TTG" = "L",
+  "TAC" = "Y", "TAT" = "Y", "TAA" = "_", "TAG" = "_",
+  "TGC" = "C", "TGT" = "C", "TGA" = "_", "TGG" = "W",
+  "CTA" = "L", "CTC" = "L", "CTG" = "L", "CTT" = "L"
+)
+
+#Identify codon number
+detect_codon  <- function(n){
+  if(n%%3==1){y <- n+c(0:2)}
+  if(n%%3==2){y <- n+c(-1:1)}
+  if(n%%3==0){y <- n+c(-2:0)}
+  return(y)
+}
+
+# Detect homopolymer regions
+get_homopolymer_flags <- function(bases, min_length = 3) {
+  rle_bases <- rle(bases)
+  flags <- rep(FALSE, length(bases))
+  
+  idx <- 1
+  for (i in seq_along(rle_bases$lengths)) {
+    len <- rle_bases$lengths[i]
+    if (len >= min_length) {
+      flags[idx:(idx + len - 1)] <- TRUE
+    }
+    idx <- idx + len
+  }
+  return(flags)
+}
+
+#Compute pseudo R^2
+compute_pseudo_r2 <- function(fit, df) {
+  rss <- deviance(fit)  # Residual sum of squares
+  tss <- sum((df$proportion - mean(df$proportion))^2)  # Total sum of squares
+  r2 <- 1 - rss / tss
+  return(r2)
+}
+
+# Function to fit Poisson model
+fit_poisson <- function(df) {
+  poisson_pmf <- function(lambda, x) dpois(x, lambda)
+  
+  fit <- nls(
+    proportion ~ poisson_pmf(lambda, n_mutated_codons),
+    data = df,
+    start = list(lambda = 1),
+    algorithm = "port"
+  )
+  
+  fit_summary <- summary(fit)
+
+  # Extract values of interest
+  lambda_est <- coef(fit)["lambda"]
+  std_error <- fit_summary$coefficients["lambda", "Std. Error"]
+  t_value <- fit_summary$coefficients["lambda", "t value"]
+  p_value <- fit_summary$coefficients["lambda", "Pr(>|t|)"]
+  residual_se <- fit_summary$sigma
+
+  rss <- deviance(fit)
+  tss <- sum((df$proportion - mean(df$proportion))^2)
+  pseudo_r2 <- 1 - rss / tss
+  cq <- chisq.test(
+    x = as.numeric(df$proportion),
+    p = dpois(df$n_mutated_codons, lambda_est),
+    rescale.p = TRUE    # rescale probabilities to sum to 1
+  ) 
+  
+  chisq_value <- cq$statistic
+  p_val_chi <- 1-pchisq(chisq_value,cq$parameter)
+  
+  # Add predictions to the data frame
+  df <- df %>%
+    mutate(predicted = dpois(n_mutated_codons, lambda_est))
+
+  # Return all values in a named list
+  list(
+    lambda = lambda_est,
+    std_error = std_error,
+    t_value = t_value,
+    p_value = p_value,
+    residual_se = residual_se,
+    pseudo_r2 = pseudo_r2,
+    chisq_value=chisq_value,
+    pval_chisq = p_val_chi,
+    data = df
+  )
+  
+}
+
+# Function to fit Poisson model. Added lower = c(lambda = 0.001) and default lambda=10
+fit_poisson_gfp <- function(df,lambda0=5) {
+  poisson_pmf <- function(lambda, x) dpois(x, lambda)
+  
+  fit <- nls(
+    proportion ~ poisson_pmf(lambda, n_mutated_codons),
+    data = df,
+    start = list(lambda = lambda0),
+    algorithm = "port", 
+    lower = c(lambda = .1)
+  )
+  fit_summary <- summary(fit)
+
+  # Extract values of interest
+  lambda_est <- coef(fit)["lambda"]
+  std_error <- fit_summary$coefficients["lambda", "Std. Error"]
+  t_value <- fit_summary$coefficients["lambda", "t value"]
+  p_value <- fit_summary$coefficients["lambda", "Pr(>|t|)"]
+  residual_se <- fit_summary$sigma
+
+  rss <- deviance(fit)
+  tss <- sum((df$proportion - mean(df$proportion))^2)
+  pseudo_r2 <- 1 - rss / tss
+  
+  cq <- chisq.test(
+    x = as.numeric(df$proportion),
+    p = dpois(df$n_mutated_codons, lambda_est),
+    rescale.p = TRUE    # rescale probabilities to sum to 1
+  ) 
+  
+  chisq_value <- cq$statistic
+  p_val_chi <- 1-pchisq(chisq_value,cq$parameter)
+  
+  # Add predictions to the data frame
+  df <- df %>%
+    mutate(predicted = dpois(n_mutated_codons, lambda_est))
+
+  # Return all values in a named list
+  list(
+    lambda = lambda_est,
+    std_error = std_error,
+    t_value = t_value,
+    p_value = p_value,
+    residual_se = residual_se,
+    pseudo_r2 = pseudo_r2,
+    data = df, 
+    chisq_value=chisq_value,
+    pval_chisq = p_val_chi,
+    experiment = df$experiment[1]
+  )
+}
+
+#Filter syn mutations
+filter_synonymus <- function(x){
+  y <- str_split(x,pattern = ";")[[1]]
+  y <- y[str_sub(y,1,1)!=str_sub(y,-1,-1)]
+  return(y)
+}
+
+#Labels for facets
+custom_labeller <- function(value) {
+  paste0("oligos to template ratio: ", value)
+}
+
+#IUPAC code mapping
+iupac_map <- list(
+  A = c("A"),
+  C = c("C"),
+  G = c("G"),
+  T = c("T"),
+  R = c("A", "G"),
+  Y = c("C", "T"),
+  S = c("G", "C"),
+  W = c("A", "T"),
+  K = c("G", "T"),
+  M = c("A", "C"),
+  N = c("A", "C", "G", "T")
+)
+
+# Function to check if base matches mutated_base code
+match_iupac <- function(base, mutated_base) {
+  # Convert to upper case for consistency
+  base <- toupper(base)
+  mutated_base <- toupper(mutated_base)
+  
+  # Check if the mutated_base exists in the map
+  valid_bases <- iupac_map[[mutated_base]]
+  
+  if (is.null(valid_bases)) {
+    return(FALSE)  # unknown or invalid IUPAC code
+  }
+  
+  return(base %in% valid_bases)
+}
+
+```
+
+
+# C-domain of Bst.NBI
+
+Load data and define relevant variables
+
+```{r NBIreference}
+# Colors for plots
+colors_exp <- c("red","darkgreen","blue","orange") 
+names(colors_exp) <- c("1","3","5","10")
+
+#Sequence
+nbi_ref_dna <- toupper("aaaaagaaaaagttacaagcagattttaatgacccacgtcaacttgaagaagtcattgaccttcttgaggtatatcatgagaaaaagaatgtgattgaagagaaaattaaagctcgcttcattgcaaataaaaatactgtatttgaatggcttacgtggaatggcttcattattcttggaaatgctttagaatataaaaacaacttcgttattgatgaagagttacaaccagttactcatgccgcaggtaaccagcctgatatggaaattatatatgaagactttattgttcttggtgaagtaacaacttctaagggagcaacccagtttaagatggaatcagaaccagtaacaaggcattatttaaacaagaaaaaagaattagaaaagcaaggagtagagaaagaactatattgtttattcattgcgccagaaatcaataagaatacttttgaggagtttatgaaatacaatattgttcaaaacacaagaattatccctctctcattaaaacagtttaacatgctcctaatggtacagaagaaattaattgaaaaaggaagaaggttatcttcttatgatattaagaatctgatggtctcattatatcgaacaactatagagtgtgaaagaaaatatactcaaattaaagctggtttagaagaaactttaaataattgggttgttgacaaggaggtaaggtttccatgg")
+ref_prot_NBI <- Biostrings::translate(DNAString(nbi_ref_dna))
+ref_prot_str_NBI <- str_split(as.character(ref_prot_NBI),"")[[1]]
+ref_nbi_dna_str <- str_split(toupper(as.character(nbi_ref_dna)),"")[[1]]
+ref_nbi_length <- nchar(nbi_ref_dna)
+
+#Oligo pool sequences
+opools_NBI <- read.table("data/NBI_oligos.txt") %>% 
+  mutate(id = paste0(ref_prot_str_NBI[15:237],384:606)) %>%
+  rename(oligo=V1) %>%
+  select(id,oligo) %>%
+  mutate(pos = 15:237) %>%
+  mutate(start_oligo = str_sub(oligo,1,1)) %>%
+  mutate(end_oligo = str_sub(oligo,-1,-1)) %>%
+  #Compute Tm as 2°C \* (A+T) + 4°C \* (G+C)
+  mutate(tm_simple = 2*(str_count(oligo,"A")+str_count(oligo,"T"))+4*(str_count(oligo,"G")+str_count(oligo,"C")))
+```
+
+Load sequences
+
+```{r NBI load}
+variantes_nbi_dna <- read.table("data/NBI_variants.txt", header=T)
+```
+
+
+We explored some statistics of the libraries.
+
+How many sequences have the wrong length, meaning have InDels?
+```{r NBI wrong length}
+table_wrong_length <- variantes_nbi_dna %>% 
+  mutate(wrong_length = muts=='wrong length') %>%
+  group_by(experiment,wrong_length)%>%
+  summarise(is_wrong_length = n()) %>% 
+  mutate(wrong_length = ifelse(wrong_length,'wrong','right')) %>%
+  pivot_wider(names_from =  wrong_length,values_from = is_wrong_length) %>%
+  mutate(percentage_wrong = wrong / (right+wrong)*100)
+
+FigS1a <- ggplot(table_wrong_length, 
+                            aes(x=as.factor(experiment),y=percentage_wrong))+
+  geom_bar(stat = 'identity')+ theme(
+    text = element_text(size = 10),         # overall text
+    axis.title = element_text(size = 10),   # axis labels
+    axis.text = element_text(size = 10),    # tick labels
+    legend.text = element_text(size = 10),  # legend labels
+    legend.title = element_text(size = 10), # legend title
+    plot.title = element_text(size = 10)    # plot title
+  )+ 
+  xlab("oPool to template ratio")+ylab("Wrong length (%)")
+
+table_wrong_length
+```
+
+How many sequences are the wild type sequence, meaning there was no mutations?
+```{r NBI wild types}
+table_wildtpes<- variantes_nbi_dna %>% 
+  filter(muts!='wrong length')%>%
+  mutate(is_wt = n_mutated_codons==0  )%>%
+  group_by(experiment,is_wt) %>%
+  summarise(n = n()) %>% 
+  mutate(is_wildtype = ifelse(is_wt,'wildtype','variant')) %>%
+  select(-is_wt)%>%
+  pivot_wider(names_from =  is_wildtype,values_from = n) %>%
+  mutate(percentage_wildtype = round(wildtype / (variant+wildtype)*100,1))
+
+table_wildtpes
+
+FigS1b <- ggplot(table_wildtpes, aes(x=as.factor(experiment),y=percentage_wildtype))+
+  geom_bar(stat = 'identity')+ theme(
+    text = element_text(size = 10),         # overall text
+    axis.title = element_text(size = 10),   # axis labels
+    axis.text = element_text(size = 10),    # tick labels
+    legend.text = element_text(size = 10),  # legend labels
+    legend.title = element_text(size = 10), # legend title
+    plot.title = element_text(size = 10)    # plot title
+  )+
+  xlab("oPool to template ratio")+ylab("Wild type (%)")
+```
+
+
+
+**FigS1**
+```{r FigS1}
+FigS1 <- ggarrange(FigS1a,FigS1b,labels = "AUTO",ncol=2)
+FigS1
+```
+
+We studied the distribution of mutations per variant (Fig 2A)
+
+```{r NBI muts distr}
+mutations_distribution <- variantes_nbi_dna %>% 
+    filter(muts!='wrong length') %>% 
+  group_by(experiment,n_mutated_codons) %>%
+  summarise(counts = n()) %>%
+  group_by(experiment) %>%
+  mutate(proportion = counts/sum(counts))
+
+# Apply the fitting function to each experiment
+results_fitPoisson <- mutations_distribution %>%
+  group_by(experiment) %>%
+  group_split() %>%
+  map(fit_poisson)
+
+# Combine the results
+all_data <- bind_rows(map(results_fitPoisson, "data"))
+fit_qual = data.frame(
+  experiment = c(1,3,5,10),
+  lambda_est = map_dbl(results_fitPoisson, "lambda"),
+  std_error = map_dbl(results_fitPoisson, "std_error"),
+  t_value=map_dbl(results_fitPoisson, "t_value"),
+  p_value=map_dbl(results_fitPoisson, "p_value"),
+  residual_se=map_dbl(results_fitPoisson, "residual_se"),
+  pseudo_r2=map_dbl(results_fitPoisson, "pseudo_r2"),
+  pval_chisq=map_dbl(results_fitPoisson, "pval_chisq"),
+  chisq_value=map_dbl(results_fitPoisson, "chisq_value")
+)
+
+lambda_estimates <- round(fit_qual$lambda_est,c(2,1,1,1))
+lambda_std <- round(fit_qual$std_error,c(2,1,1,1))
+names(lambda_estimates) <- unique(mutations_distribution$experiment)
+names(lambda_std) <- unique(mutations_distribution$experiment)
+
+lambda_estimates_df = data.frame(experiment = c(1,3,5,10),lam = lambda_estimates, std=lambda_std)
+
+lambda_labels <- tibble(
+  experiment = unique(all_data$experiment),
+  label = paste0("Experiment: ", unique(all_data$experiment), "\nλ = ", round(lambda_estimates, 3))
+)
+
+all_data <- all_data %>%
+  left_join(lambda_labels, by = "experiment") %>%
+         mutate(label = factor(label, levels=c("Experiment: NBIr1\nλ = 0.777","Experiment: NBIr3\nλ = 2.661","Experiment: NBIr5\nλ = 6.139","Experiment: NBIr10\nλ = 10.369","Experiment: NBIr3recJf\nλ = 0.752","Experiment: NBIr1recJf\nλ = 0.224")))
+
+mutations_distribution <- all_data
+rm(all_data)
+
+# Plot results
+lambda_estimates_df$label = paste0("\u03BB=", format(round(lambda_estimates_df$lam,1), nsmall = 1), " \u00B1 ", format(round(lambda_estimates_df$std,1), nsmall = 1))
+  
+Fig2A <- ggplot(mutations_distribution , aes(x = n_mutated_codons)) +
+  geom_bar(aes(y = proportion),fill=grey(.3), stat = "identity", alpha = 0.5, width = 0.8) +
+  geom_line(aes(y = predicted, color = as.factor(experiment)))+#, linetype = "dashed") +
+  labs(
+    x = "Number of Mutations Per Variant",
+    y = "Proportion"
+  ) +
+  theme(legend.position = "none",
+    text = element_text(size = 10),         # overall text
+    axis.title = element_text(size = 10),   # axis labels
+    axis.text = element_text(size = 10),    # tick labels
+    legend.text = element_text(size = 10),  # legend labels
+    legend.title = element_text(size = 10), # legend title
+    plot.title = element_text(size = 10))+    # plot title)+
+  facet_wrap(~experiment,nrow=1, labeller = as_labeller(custom_labeller))+
+  scale_color_manual(values = colors_exp)+
+  geom_text(data = lambda_estimates_df,aes(x=10,y=0.4,label = label),parse=F)+
+  xlim(c(-1,18))
+
+Fig2A
+
+```
+
+Statistical test to indicate that our experimental data actually follows a Poisson distribution
+
+```{r chitest}
+chisq.test(x = mutations_distribution %>% filter(experiment==1) %>% select(proportion,predicted), 
+           rescale.p=TRUE)
+
+
+chisq.test(x = mutations_distribution %>% filter(experiment==3) %>% select(proportion,predicted), 
+           rescale.p=TRUE)
+
+
+chisq.test(x = mutations_distribution %>% filter(experiment==5) %>% select(proportion,predicted), 
+           rescale.p=TRUE)
+
+
+chisq.test(x = mutations_distribution %>% filter(experiment==10) %>% select(proportion,predicted), 
+           rescale.p=TRUE)
+
+```
+
+
+How many good-length variants are explored
+```{r}
+variantes_nbi_dna %>%
+  filter(muts!="wrong_lenth")%>%
+  group_by(experiment) %>%
+  summarise(analysed_clones = n())
+```
+
+How many non-wildtype, good-length variants are explored
+```{r}
+variantes_nbi_dna %>%
+  filter(!is.na(mutations.AA.from.codons)) %>% 
+  group_by(experiment) %>%
+  summarise(analysed_clones = n())
+```
+
+
+Which amino acids are explored in each position (I take only non-wildtye sequences and subset to 2778 - the minimum)
+```{r aa explored}
+nbi_explored_mutations <- variantes_nbi_dna %>%
+  filter(!is.na(mutations.AA.from.codons)) %>% 
+  group_by(experiment)%>%
+  slice_sample(n=2778) %>%
+  select(experiment,mutations.AA.from.codons) %>%
+  mutate(mutations.AA.from.codons.list = str_split(mutations.AA.from.codons,";")) %>%
+  select(-mutations.AA.from.codons)%>%
+  unnest() %>%
+  group_by(experiment,mutations.AA.from.codons.list) %>%
+  summarise(counts_variants=n())%>%
+  mutate(Position = as.numeric(str_sub(mutations.AA.from.codons.list,2,-2)) ) %>%
+  mutate(aa_original = str_sub(mutations.AA.from.codons.list,1,1)) %>%
+  mutate(aa_explored = str_sub(mutations.AA.from.codons.list,-1,-1)) %>%
+  arrange(Position,aa_explored) %>% 
+  filter(Position>14) %>%
+  mutate(aa_explored = ifelse(aa_explored=="_","*", aa_explored))
+
+FigS4 <- ggplot(nbi_explored_mutations,aes(x=Position,y=aa_explored, fill=counts_variants))+
+  geom_tile()+
+  ylab("Explored mutations")+ 
+  scale_x_continuous(expand = c(0, 0))+
+  scale_fill_continuous(type = "viridis", name="Counts",    trans = "log10",
+    labels = scales::trans_format("log10", scales::math_format(10^.x)))+
+    facet_wrap(~experiment,ncol=1,label=as_labeller(custom_labeller))+
+  theme(strip.background = element_blank(),          # removes box
+    strip.text = element_text(hjust = 0), 
+    text=element_text(size=20), 
+    axis.title = element_text(size=20),
+    axis.title.y = element_text(size=20),
+    legend.title = element_text(size = 18), 
+    legend.text  = element_text(size = 18)
+)
+
+FigS4
+
+```
+
+
+
+Fig2B - only 1x ratio
+```{r aa explored 2}
+nbi_explored_mutations_full10 <- variantes_nbi_dna %>%
+  filter(experiment==10) %>% 
+  filter(!is.na(mutations.AA.from.codons)) %>% 
+  select(experiment,mutations.AA.from.codons) %>%
+  mutate(mutations.AA.from.codons.list = str_split(mutations.AA.from.codons,";")) %>%
+  select(-mutations.AA.from.codons)%>%
+  unnest() %>%
+  group_by(experiment,mutations.AA.from.codons.list) %>%
+  summarise(counts_variants=n())%>%
+  mutate(Position = as.numeric(str_sub(mutations.AA.from.codons.list,2,-2)) ) %>%
+  mutate(aa_original = str_sub(mutations.AA.from.codons.list,1,1)) %>%
+  mutate(aa_explored = str_sub(mutations.AA.from.codons.list,-1,-1)) %>%
+  arrange(Position,aa_explored) %>% 
+  filter(Position>14) %>%
+  mutate(aa_explored = ifelse(aa_explored=="_","*", aa_explored))
+
+Fig2B <- ggplot(nbi_explored_mutations_full10,aes(x=Position,y=aa_explored, fill=counts_variants))+
+  geom_tile()+
+  ylab("Explored mutations")+ 
+  scale_x_continuous(expand = c(0, 0))+
+  scale_y_discrete(guide = guide_axis(n.dodge = 2))+
+
+  scale_fill_continuous(type = "viridis", name="Counts",    trans = "log10",
+    labels = scales::trans_format("log10", scales::math_format(10^.x)))+
+    facet_wrap(~experiment,ncol=1,label=as_labeller(custom_labeller))+
+  theme(strip.background = element_blank(),          # removes box
+    strip.text = element_text(hjust = 0), 
+    text=element_text(size=10), 
+    axis.title = element_text(size=10),
+    axis.title.y = element_text(size=10),
+    axis.text.y = element_text(size=8),
+    legend.title = element_text(size = 8),
+    legend.text = element_text(size = 8,hjust = 0,margin = margin(0,0,0,0)), 
+    legend.spacing.x = unit(0.1, "cm"),
+    legend.key.spacing.x = unit(0,"mm"),
+    legend.key.width = unit(0.3, "cm"),
+    legend.position = "right",
+    legend.margin = margin(0,0,0,0)) 
+```
+
+
+
+
+```{r explored per pos}
+nbi_explored_mutations_perpos <- nbi_explored_mutations %>% 
+  filter(aa_original!=aa_explored) %>%
+  group_by(Position,experiment) %>%
+  summarise(explored_mutations=n()) 
+```
+
+```{r check1}
+nbi_explored_mutations_perpos %>%
+  filter(Position>14) %>%
+  group_by(experiment) %>%
+  summarise(total_mutations = sum(explored_mutations)) %>%
+  mutate(percentage_explored_mutation_from_all_possible = round(total_mutations/(20*223)*100,2))
+```
+
+```{r aa explored counts}
+nbi_explored_mutations <- variantes_nbi_dna %>%
+  filter(!is.na(mutations.AA.from.codons)) %>% 
+  select(experiment,mutations.AA.from.codons) %>%
+  mutate(mutations.AA.from.codons.list = str_split(mutations.AA.from.codons,";")) %>%
+  select(-mutations.AA.from.codons)%>%
+  unnest() %>%
+  group_by(experiment,mutations.AA.from.codons.list) %>%
+  summarise(counts_variants=n())%>%
+  mutate(Position = as.numeric(str_sub(mutations.AA.from.codons.list,2,-2)) ) %>%
+  mutate(aa_original = str_sub(mutations.AA.from.codons.list,1,1)) %>%
+  mutate(aa_explored = str_sub(mutations.AA.from.codons.list,-1,-1)) %>%
+  arrange(Position,aa_explored) %>% 
+  filter(Position>14)%>% 
+  group_by(experiment,Position) %>%
+  summarise(n=sum(counts_variants))
+FigS5 <- ggplot(nbi_explored_mutations,aes(x=Position, y=n))+
+  geom_point()+geom_line()+facet_wrap(~experiment,scales="free",ncol=1,label=as_labeller(custom_labeller))+
+  ylab("Counts")+ggtitle("How many variants contain a mutation in a given position")+scale_y_continuous(n.breaks = 3)
+
+FigS5
+
+
+```
+
+How many joint amino acid mutations are explored?
+This code takes a few minutes, so results are provided in data/ and uploaded in next code block.
+```{r joint mutations, eval=FALSE}
+get_pairs <- function(mutation_string, experiment) {
+  muts <- unlist(strsplit(mutation_string, ";"))
+  pairs <- combn(muts, 2, simplify = FALSE)
+  
+  tibble(
+    experiment = experiment,
+    mutation_pair = sapply(pairs, function(x){ paste(x, collapse = ";")})
+  )
+}
+
+# Apply to each row
+nbi_pair_mutations <- variantes_nbi_dna %>% select(experiment,mutations.AA.from.codons,n_mutated_codons_rmsyn) %>% filter(n_mutated_codons_rmsyn>1) %>%
+  rowwise() %>%
+  do(get_pairs(.$mutations.AA.from.codons, .$experiment)) %>%
+  ungroup()
+
+nbi_pair_mutations <- nbi_pair_mutations %>%
+  group_by(experiment,mutation_pair) %>%
+  summarise(counts= n())
+save(nbi_pair_mutations, file="NBI_pair_mutations.Rdata")
+```
+
+```{r}
+nbi_pair_mutations_stats <- read.table("data/NBI_PairMutations.txt", header=T) %>%
+  group_by(experiment) %>%
+  summarise(n_different_pairs = n())
+
+nbi_pair_mutations_stats
+```
+
+
+## Biases in oligos efficiency
+
+Mutations frequencies vs oligo
+
+```{r}
+mutations_position <- variantes_nbi_dna %>% 
+  filter(muts !="wrong length") %>% 
+  select(mutations.codons,experiment) %>% 
+  mutate(mutations.codons =str_split(mutations.codons,";"))%>%
+  unnest() %>%
+  filter(!is.na(mutations.codons))%>%
+  mutate(pos = as.numeric(str_sub(mutations.codons,4,-4)), 
+         start_codon = str_sub(mutations.codons,1,3),
+         end_codon =str_sub(mutations.codons,-3))
+
+mutations_by_oligo <- mutations_position %>%
+  group_by(pos,experiment) %>%
+  summarise(counts=n()) %>%
+  left_join(opools_NBI) %>%
+  filter(!is.na(id))
+```
+
+Check if distributions are normal by Shapito test
+
+```{r}
+mutations_by_oligo %>% 
+  group_by(experiment,start_oligo) %>% 
+  summarise(pval=shapiro.test(counts)$p.value)  %>%
+  mutate(signif = case_when(pval<0.001 ~ '***',pval<0.01~'**',pval<0.05~'*',pval>=0.05~'N.S.')) %>%
+  select(-pval) %>%
+  pivot_wider(names_from= experiment,values_from = signif)
+```
+
+```{r}
+ggplot(mutations_by_oligo, aes(sample = counts)) +
+  facet_grid(experiment~start_oligo,scales="free") + 
+  stat_qq() + 
+  stat_qq_line()+
+  ggtitle("NBI| Check normality")
+```
+
+-\> Not normal
+
+Then use kruskal test to see if distributions are statistically different
+
+```{r}
+for(i in unique(mutations_by_oligo$experiment)){
+ print(i)
+  print(kruskal.test(counts ~ start_oligo, data = mutations_by_oligo%>% filter(experiment ==i)))
+}
+```
+
+As all p-values are smaller than 0.05, I move to dunn test statistical differences in all combinations
+```{r Dunn Test 5p}
+exps <- unique(mutations_by_oligo$experiment)
+
+for(i in seq_along(exps)){
+  DunnTest <- DunnTest(counts ~ start_oligo , 
+                       data = mutations_by_oligo %>% filter(experiment==exps[i]),
+                       method = "bonferroni")
+  DunnTest$pmat[lower.tri(DunnTest$pmat,diag = T)] <- NA
+  dunn_test_df <- as.data.frame(as.table(DunnTest$pmat)) %>%
+    filter(!is.na(Freq)) %>%  
+    dplyr::rename(pval=Freq) %>%
+    mutate(experiment=exps[i])
+  
+  if(i >1 ){
+    dunnTestDF <- rbind(dunnTestDF,dunn_test_df)
+  }else{
+    dunnTestDF <- dunn_test_df
+  }
+}
+dunnTestDF <- dunnTestDF %>% 
+  mutate(signif = case_when(pval<0.001 ~ '***',pval<0.01~'**',pval<0.05~'*',pval>=0.05~'N.S.')) %>%
+  mutate(y_plot = sample(seq(500,3000),size = nrow(dunnTestDF))) %>%
+  mutate(Var1 = factor(Var1,levels=c("A","C","G","T")),Var2 = factor(Var2,levels=c("A","C","G","T"))) %>%
+  mutate(x_plot = (as.numeric(Var1)+as.numeric(Var2))/2)
+
+mutations_by_oligo <- mutations_by_oligo%>%
+  mutate(start_oligo = factor(start_oligo,levels=c("A","C","G","T")))
+
+mutations_by_oligo%>% group_by(experiment,start_oligo) %>%
+  summarise(pval=shapiro.test(counts)$p.value) %>%
+  mutate(is_normally_distr = pval>0.05)
+
+```
+
+Repeat for 3' base:  there is no significant differences
+
+Shapiro test to check normality
+
+```{r}
+mutations_by_oligo %>% 
+  group_by(experiment,end_oligo) %>% 
+  summarise(pval=shapiro.test(counts)$p.value)  %>%
+  mutate(signif = case_when(pval<0.001 ~ '***',pval<0.01~'**',pval<0.05~'*',pval>=0.05~'N.S.')) %>%
+  select(-pval) %>%
+  pivot_wider(names_from= experiment,values_from = signif)
+```
+
+```{r}
+for(i in unique(mutations_by_oligo$experiment)){
+ print(i)
+  print(kruskal.test(counts ~ end_oligo, data = mutations_by_oligo%>% filter(experiment ==i)))
+}
+
+```
+
+DunnTest for 3' end of oligos
+
+```{r}
+exps <- unique(mutations_by_oligo$experiment)
+
+for(i in seq_along(exps)){
+  DunnTest <- DunnTest(counts ~ end_oligo , 
+                       data = mutations_by_oligo %>% filter(experiment==exps[i]),
+                       method = "bonferroni")
+  DunnTest$pmat[lower.tri(DunnTest$pmat,diag = T)] <- NA
+  dunn_test_df <- as.data.frame(as.table(DunnTest$pmat)) %>%
+    filter(!is.na(Freq)) %>%  
+    dplyr::rename(pval=Freq) %>%
+    mutate(experiment=exps[i])
+  
+  if(i >1 ){
+    dunnTestDF_3prime <- rbind(dunnTestDF_3prime,dunn_test_df)
+  }else{
+    dunnTestDF_3prime <- dunn_test_df
+  }
+}
+dunnTestDF_3prime <- dunnTestDF_3prime %>% 
+  mutate(signif = case_when(pval<0.001 ~ '***',pval<0.01~'**',pval<0.05~'*',pval>=0.05~'N.S.')) %>%
+  mutate(y_plot = sample(seq(500,3000),size = nrow(dunnTestDF))) %>%
+  mutate(Var1 = factor(Var1,levels=c("A","C","G","T")),Var2 = factor(Var2,levels=c("A","C","G","T"))) %>%
+  mutate(x_plot = (as.numeric(Var1)+as.numeric(Var2))/2)
+
+dunnTestDF_3prime
+```
+
+They are all not significant
+
+```{r FigureS biases}
+dunnTestDF$y_plot[dunnTestDF$signif!="N.S."] <- c(900,500,300,200,120,
+                                       900,600,400,
+                                       0.8,1.2,1.5,
+                                       0.8,1.2,1.5)
+plot_bias5 <- ggplot(mutations_by_oligo, aes(y=counts,x=start_oligo))+
+  geom_boxplot(notch = TRUE)+
+  geom_segment(data=dunnTestDF %>% filter(signif!="N.S."), aes(x=Var1,xend=Var2,y=y_plot),col=grey(.5))+
+  geom_text(data=dunnTestDF %>% filter(signif!="N.S."), aes(x=x_plot,y=y_plot,label=signif),col=grey(.5))+
+  facet_wrap(~experiment,label=as_labeller(custom_labeller),nrow=1)+
+  scale_y_log10()+
+  xlab("5' base in oligo")+
+  ylab("Counts")+ scale_y_log10(guide = "axis_logticks")+
+  theme(legend.position = "none",
+    text = element_text(size = 8),         # overall text
+    axis.title = element_text(size = 8),   # axis labels
+    axis.text = element_text(size = 8),    # tick labels
+    legend.text = element_text(size = 8),  # legend labels
+    legend.title = element_text(size = 8), # legend title
+    plot.title = element_text(size = 8))
+
+
+plot_bias3 <-ggplot(mutations_by_oligo, aes(y=counts,x=end_oligo))+
+  geom_boxplot(notch = TRUE)+
+  facet_wrap(~experiment,label=as_labeller(custom_labeller),nrow=1)+
+  scale_y_log10()+
+  xlab("3' base in oligo")+
+  ylab("Counts")+ scale_y_log10(guide = "axis_logticks")+
+  theme(legend.position = "none",
+    text = element_text(size = 8),         # overall text
+    axis.title = element_text(size = 8),   # axis labels
+    axis.text = element_text(size = 8),    # tick labels
+    legend.text = element_text(size = 8),  # legend labels
+    legend.title = element_text(size = 8), # legend title
+    plot.title = element_text(size = 8))
+```
+
+```{r}
+
+FigS2 <-    ggarrange(plotlist = list(plot_bias5,plot_bias3),ncol=1,labels = "AUTO")
+FigS2
+```
+
+Figure 2C for main text
+```{r Fig2c}
+exp_targ = 3
+dunnTestDF_targ <- dunnTestDF %>% filter(experiment==exp_targ) %>%
+  filter(signif!="N.S.") %>%
+  mutate(y_plot=c(900,550,300))
+Fig2C<- ggplot(mutations_by_oligo %>% filter(experiment==3), aes(y=counts,x=start_oligo))+
+  geom_boxplot(notch = TRUE)+
+  geom_segment(data=dunnTestDF_targ ,
+               aes(x=Var1,xend=Var2,y=y_plot))+
+  geom_text(data=dunnTestDF_targ, 
+            aes(x=x_plot,y=y_plot,label=signif))+
+  scale_y_log10(limits=c(NA,1200),guide = "axis_logticks")+
+  xlab("5' base in oligo")+
+  ylab("Counts")+ 
+  theme_bw()+
+  theme(legend.position = "none",
+    panel.grid.major = element_blank(), # Removes major gridlines
+    panel.grid.minor = element_blank(), # Removes minor gridlines
+    text = element_text(size = 10),         # overall text
+    axis.title = element_text(size = 10),   # axis labels
+    axis.text = element_text(size = 10),    # tick labels
+    legend.text = element_text(size = 10),  # legend labels
+    legend.title = element_text(size = 8), # legend title
+    plot.title = element_text(size = 8),
+    panel.border = element_rect(fill = NA, color = "black", size = 1))
+ 
+
+```
+
+**Figure 2**
+
+```{r Figure 2}
+Figure2 <- ggarrange(Fig2A,
+          ggarrange(Fig2B, Fig2C, ncol = 2, labels = c("B", "C"), widths = c(3,1)),
+          nrow = 2,heights = c(1,1.5),
+          labels = "A"                                        # Labels of the scatter plot
+          ) 
+Figure2
+```
+
+
+We also studied if there was dependency on the Tm of the oligos. We computed the Tm using NEB interface. 
+
+```{r}
+
+tm_neb = read.table("data/tmcalc_batch_NEB.txt") %>%
+  select(V2,V3) %>% dplyr::rename(spec_oligo=V2,Tm_NEB=V3)
+
+muts_tm <- mutations_position %>%
+  group_by(pos,experiment,start_codon, end_codon) %>%
+  summarise(counts=n()) %>%
+  left_join(opools_NBI) %>%
+  filter(!is.na(id)) %>%
+  mutate(spec_oligo = str_replace(oligo,"NNK",end_codon)) %>%
+  left_join(tm_neb,by=join_by("spec_oligo"))
+
+
+tm_neb_sum <- tm_neb %>% mutate(counts = 1,experiment="oPool") %>%
+  rbind(
+  muts_tm %>% ungroup()%>% group_by(experiment) %>%
+    select(experiment,Tm_NEB,counts,spec_oligo)) %>%
+  mutate(start_base = str_sub(spec_oligo,1,1))%>%
+  group_by(Tm_NEB,experiment,start_base) %>%
+  summarise(counts_tm = sum(counts)) %>%
+  ungroup() %>% group_by(experiment,start_base) %>%
+  mutate(counts_tm = counts_tm/sum(counts_tm)*100) %>%
+  mutate(experiment = factor(experiment,levels=c("oPool","1","3","5","10"))) %>%
+  mutate(lw = ifelse(experiment=="oPool",'thin','not'))
+
+
+tm_neb_sum <- tm_neb %>% mutate(counts = 1,experiment="oPool") %>%
+  rbind(
+  muts_tm %>% ungroup()%>% group_by(experiment) %>%
+    select(experiment,Tm_NEB,counts,spec_oligo)) %>%
+  mutate(start_base = str_sub(spec_oligo,1,1))%>%
+  group_by(Tm_NEB,experiment) %>%
+  summarise(counts_tm = sum(counts)) %>%
+  ungroup() %>% group_by(experiment) %>%
+  mutate(counts_tm = counts_tm/sum(counts_tm)*100) %>%
+  mutate(experiment = factor(experiment,levels=c("oPool","1","3","5","10"))) %>%
+  mutate(Sample = ifelse(experiment=="oPool",'oPool','Libraries')) %>%
+  group_by(Sample,Tm_NEB) %>%
+  summarise(counts_av = mean(counts_tm), counts_sd = sd(counts_tm),counts_min=min(counts_tm),counts_max = max(counts_tm))%>%
+  mutate(lw = ifelse(Sample=="oPool",'thin','not'))
+  
+
+FigS3 <- ggplot(data = tm_neb_sum,aes(col=Sample))+
+  geom_line(data = tm_neb_sum %>% filter(Sample=='oPool'),
+            aes(x=Tm_NEB, y = counts_av,), size=1.5)+
+  geom_point(data = tm_neb_sum %>% filter(Sample=='Libraries'),
+            aes(x=Tm_NEB, y = counts_av))+
+  geom_line(data = tm_neb_sum %>% filter(Sample=='Libraries'),
+            aes(x=Tm_NEB, y = counts_av),size=.5)+
+  geom_errorbar(data=tm_neb_sum %>% filter(Sample=="Libraries"),
+                aes(x=Tm_NEB, y = counts_av,ymax=counts_av+counts_sd,ymin=counts_av-counts_sd))+
+  xlab("Melting temperature (°C)")+ylab("Percentage")+
+  scale_color_manual(values = setNames(c('blue','grey'),c('Libraries','oPool')),name="")+
+  scale_size_manual(values=c("thin"=2,"not"=1),guide="none")+
+  theme(legend.position = "inside",legend.position.inside = c(.2,.9),legend.background = element_blank(),
+    text = element_text(size = 12),         # overall text
+    axis.title = element_text(size = 8),   # axis labels
+    axis.text = element_text(size = 8),    # tick labels
+    legend.text = element_text(size = 12),  # legend labels
+    legend.title = element_text(size = 8), # legend title
+    plot.title = element_text(size = 8))
+
+FigS3
+
+```
+
+
+
+
+```{r}
+##--------------------------------##
+## Analysis for NBI
+##--------------------------------##
+round_to_se <- function(estimate, se, digits = 1) {
+  dec <- floor(log10(se))
+  se_rounded <- signif(se, digits)
+  est_rounded <- signif(estimate, digits)
+  list(est = est_rounded, se = se_rounded)
+}
+
+# Load data
+df <- read.csv('data/RealTimeRecoveryPCR.csv', header=T, sep=";", dec = ',') %>%
+  select(-1) %>%
+  pivot_longer(-Cycle) %>%
+  rename(well=name, intensity=value) %>%
+  group_by(well)%>%
+  mutate(int0 = intensity-min(intensity)+1) %>% 
+  ungroup() %>%
+  mutate(int0_log10 = log10(int0))
+# Clean data
+df <- df %>%
+  filter(!(well=="D4" & Cycle>19))%>%
+  filter(!(well=="D6" & Cycle>19))%>%
+  filter(!(well=="D8" & Cycle>19))%>%
+  filter(!(well=="E5" & Cycle>19))%>%
+  filter(!(well=="E7" & Cycle>19))
+
+df <- df %>%   filter(well %in% c("D4","D6","D8","E5"))%>%
+  mutate(well = recode(well,
+                       "D4" = "oPool to template ratio:1",
+                       "D6" = "oPool to template ratio:3",
+                       "D8" = "oPool to template ratio:5",
+                       "E5" = "oPool to template ratio:10"
+  ))
+
+fits <- df %>%
+  group_by(well) %>%
+  do({
+    fit <- nls(int0 ~ a * n^Cycle + b,
+               start = list(a = 1, n = 2, b = 1),
+               data = .)
+    # Extract coefficient table
+    coefs <- summary(fit)$coefficients
+    # Build a one-row tibble
+    tibble(
+      well = unique(.$well),
+      a = coefs["a", "Estimate"],
+      se_a = coefs["a", "Std. Error"],
+      n = coefs["n", "Estimate"],
+      se_n = coefs["n", "Std. Error"],
+      b = coefs["b", "Estimate"],
+      se_b = coefs["b", "Std. Error"]
+    )
+  }) %>%
+  ungroup()  %>% 
+  mutate(
+    a_fmt  = signif(a,  abs(floor(log10(se_a)))),
+    se_a_fmt = signif(a,abs(floor(log10(se_a)))),
+    n_fmt  = signif(n, abs(floor(log10(se_n)))),
+    se_n_fmt =  signif(se_n, abs(floor(log10(se_n)))),
+    b_fmt  =  signif(b, abs(floor(log10(se_b)))),
+    se_b_fmt =  signif(se_b, abs(floor(log10(se_b))))
+  ) %>%
+  ungroup()%>% 
+  mutate(label = paste0(
+    "Int == ", round(a_fmt,2), '  %*%  ', round(n_fmt, 2), "^Cycle + ", round(b_fmt)
+  ))
+
+fit_data <- data.frame(Cycle=seq(0,20)) %>%
+  mutate(y=fits$a[1]*fits$n[1]^Cycle+fits$b[1], well=fits$well[1]) %>%
+  rbind(data.frame(Cycle=seq(0,20)) %>%
+  mutate(y=fits$a[2]*fits$n[2]^Cycle+fits$b[2], well=fits$well[2])) %>%
+  rbind(data.frame(Cycle=seq(0,20)) %>%
+  mutate(y=fits$a[3]*fits$n[3]^Cycle+fits$b[3], well=fits$well[3])) %>%
+  rbind(data.frame(Cycle=seq(0,20)) %>%
+  mutate(y=fits$a[4]*fits$n[4]^Cycle+fits$b[4], well=fits$well[4]))
+  
+colors_exp <- c("red","darkgreen","blue","orange") 
+names(colors_exp) <- c( "oPool to template ratio:1" , "oPool to template ratio:3" , "oPool to template ratio:5" , "oPool to template ratio:10")
+
+FigS8 <- ggplot(df, aes(x=Cycle,y=int0,col=well))+
+  geom_point()+geom_line()+
+  geom_line(data=fit_data, aes(x=Cycle,y=y),col='red')+
+  scale_color_manual(values = colors_exp)+
+  facet_wrap(~well)+
+  geom_text(data=fits,
+            aes(label =label, x=0,y=1500),inherit.aes = F,hjust = 0,parse=T,size.unit = "pt", size=9)+
+  ylab("Intensity")+theme(legend.position = "none") +
+  theme(legend.position = "none",
+        text = element_text(size = 10),         # overall text
+        axis.title = element_text(size = 10),   # axis labels
+        axis.text = element_text(size = 10),    # tick labels
+        legend.text = element_text(size = 10),  # legend labels
+        legend.title = element_text(size = 10), # legend title
+        plot.title = element_text(size = 10))
+
+
+FigS8
+
+```
+
+
+# GFP
+
+Reference sequences
+
+```{r}
+gfp_ref_dna <- "agcaaaggcgaagaactgtttaccggcgtggtgccgattctggtggaactggatggcgatgtgaacggccataaatttagcgtgcgcggcgaaggcgaaggcgatgcgaccaacggcaaactgaccctgaaatttatttgcaccaccggcaaactgccggtgccgtggccgaccctggtgaccaccctgacctatggcgtgcagtgctttagccgctatccggatcatatgaaacgccatgatttttttaaaagcgcgatgccggaaggctatgtgcaggaacgcaccattagctttaaagatgatggcacctataaaacccgcgcggaagtgaaatttgaaggcgataccctggtgaaccgcattgaactgaaaggcattgattttaaagaagatggcaacattctgggccataaactggaatataactttaacagccataacgtgtatattaccgcggataaacagaaaaacggcattaaagcgaactttaaaattcgccataacgtggaagatggcagcgtgcagctggcggatcattatcagcagaacaccccgattggcgatggcccggtgctgctgccggataaccattatctgagcacccagagcgtgctgagcaaagatccgaacgaaaaacgcgatcatatggtgctgctggaatttgtgaccgcggcgggcattacccatggcatggatgaactgtataaagcggcgaacgatgaaaactatgcgctggcggcg"
+gfp_ref_dna <-toupper(gfp_ref_dna )
+gfp_ref_prot <- Biostrings::translate(DNAString(gfp_ref_dna))
+gfp_ref_prot_str <- str_split(as.character(gfp_ref_prot),"")[[1]]
+gfp_ref_dna_str <- str_split(as.character(gfp_ref_dna),"")[[1]]
+
+expected_length_gfp_dna <- nchar(gfp_ref_dna) #744
+expected_length_gfp_aa <- nchar(gfp_ref_prot)#·248
+
+ref_gfp_homopolymers <- data.frame(base = gfp_ref_dna_str) %>%
+  mutate(homopolymer= get_homopolymer_flags(base)) %>%
+  mutate(pos= seq(base))
+
+experiment_names <- c("SPA + Beads purification", "dsDNA", "SPA + Gel purification", "λ-exonuclease degradation", "Wild type", "Negative control")
+
+names(experiment_names)[1:4] <- c("BiotinBeads" ,"dsDNA","GelPurif"  ,  "LambdaExo"   ) 
+
+```
+
+Load data
+
+```{r}
+variantes_gfp_dna <- read.table("data/GFP_variants.txt", header=T)
+variantes_gfp_dna$mutations.aa <- sapply(variantes_gfp_dna$mutations.AA.from.codons,
+                                         function(x){str_split(x,";")[[1]]})
+variantes_gfp_dna$experiment <- factor(variantes_gfp_dna$experiment,
+                                       level=c("λ-exonuclease degradation", "SPA + Beads purification","SPA + Gel purification","dsDNA" )) 
+```
+
+Load oligo pool 
+
+```{r}
+opools_GFP <- read.table("data/GFP_oligos.txt") %>% 
+  rename(oligo=V1) %>%
+  mutate(oligo_end = str_sub(oligo,16,27))%>%
+  mutate(pos_oligo=str_locate(string = toupper(gfp_ref_dna),pattern=oligo_end)) 
+opools_GFP$pos_dna = opools_GFP$pos_oligo[,1]-3
+opools_GFP$codon_original <- str_sub(gfp_ref_dna,opools_GFP$pos_dna,opools_GFP$pos_dna+2)
+opools_GFP <- opools_GFP %>%
+  mutate(pos_codon = (pos_dna +2) /3) %>%
+  mutate(codon_mut = str_sub(oligo,13,15)) 
+opools_GFP$aminoacid = sapply(opools_GFP$codon_mut, DNAString)
+opools_GFP$aminoacid = sapply(opools_GFP$aminoacid, Biostrings::translate)
+opools_GFP$aminoacid = sapply(opools_GFP$aminoacid,as.character)
+opools_GFP <- opools_GFP %>%
+  mutate(id = paste0(gfp_ref_prot_str[pos_codon],pos_codon,aminoacid)) %>%
+  mutate(start_oligo = str_sub(oligo,1,1)) %>%
+  mutate(end_oligo = str_sub(oligo,-1,-1)) %>%
+  mutate(tm_simple = 2*(str_count(oligo,"A")+str_count(oligo,"T"))+4*(str_count(oligo,"G")+str_count(oligo,"C"))) %>%
+  select(-pos_oligo,-oligo_end) %>%
+  mutate(codon_mismatches = mapply(function(x, y) sum(strsplit(x, NULL)[[1]] != strsplit(y, NULL)[[1]]), codon_original, codon_mut), mutations_codons = paste0(codon_original,pos_codon,codon_mut))
+```
+
+
+How many reads per experiment
+```{r}
+variantes_gfp_dna %>% 
+  group_by(experiment) %>%
+  summarise(total_variants = n())
+  
+```
+
+
+Distribution of number of mutations
+
+Compute distribution of # mutations
+```{r}
+mutations_distribution_gfp <- variantes_gfp_dna %>% 
+  group_by(experiment,n_mutated_codons) %>%
+  summarise(counts = n()) %>%
+  group_by(experiment) %>%
+  mutate(proportion = counts/sum(counts)) %>%
+  ungroup()
+```
+
+
+Fit distributions by Poisson, but ignore wild types for the fitting as they are quiet a lot and will impair the convergence
+```{r}
+# Apply the fitting function to each experiment
+results_fitPoisson_gfp <- mutations_distribution_gfp %>%
+  #filter(!(n_mutated_codons==0 & experiment=="dsDNA")) %>%  # Remove wild types
+  group_by(experiment) %>%
+  mutate(proportion = counts/sum(counts)) %>%
+  group_split() %>%
+  map(fit_poisson_gfp)  # Fit by poisson
+
+# Combine the results
+lambda_estimates_df = data.frame(
+  experiment = levels(mutations_distribution_gfp$experiment)[map_int(results_fitPoisson_gfp, "experiment")],
+  lam = map_dbl(results_fitPoisson_gfp, "lambda"),
+  std=map_dbl(results_fitPoisson_gfp, "std_error"),
+  t_value=map_dbl(results_fitPoisson_gfp, "t_value"),
+  p_value=map_dbl(results_fitPoisson_gfp, "p_value"),
+  residual_se=map_dbl(results_fitPoisson_gfp, "residual_se"),
+  pseudo_r2=map_dbl(results_fitPoisson_gfp, "pseudo_r2"),
+  pval_chisq=map_dbl(results_fitPoisson_gfp, "pval_chisq"),
+  chisq_value=map_dbl(results_fitPoisson_gfp, "chisq_value")) %>%
+  mutate(label = paste0("\u03BB=",format(round(lam, 1), nsmall = 1),
+                        " \u00B1 ",format(round(std,1), nsmall = 1))) %>%
+    mutate(experiment=factor(experiment,levels=experiment_names[c(4,1,3,2)])) 
+
+results_fitPoisson_gfp_data <- bind_rows(map(results_fitPoisson_gfp, "data")) 
+print(paste(lambda_estimates_df$experiment,round(lambda_estimates_df$lam,2)))
+
+results_fitPoisson_gfp_data <- 
+  results_fitPoisson_gfp_data %>%
+  group_by(experiment)%>%
+  mutate(sum_counts = sum(counts))%>%
+  ungroup()%>%
+  left_join(lambda_estimates_df, by = "experiment")  %>%
+  mutate(fill_bar = ifelse(n_mutated_codons == 0, "highlight", "normal")) 
+
+
+
+Fig3a <- ggplot(results_fitPoisson_gfp_data , aes(x = n_mutated_codons)) +
+    geom_bar(aes(y = proportion,fill = fill_bar), stat = "identity", alpha = 0.5, width = 0.8) +
+    scale_fill_manual(values = c("highlight" = "lightcoral", "normal" = "grey50")) +
+    geom_line(aes(y = predicted),color='black')+
+    labs(
+      x = "Number of Mutations Per Variant",
+      y = "Proportion"
+    ) +
+  scale_x_continuous(breaks=c(0,10,20))+
+    theme(legend.position = "none",
+      text = element_text(size = 8,color='black'),         # overall text
+      axis.title = element_text(size = 8),   # axis labels
+      axis.text = element_text(size = 8),    # tick labels
+      legend.text = element_text(size = 8),  # legend labels
+      legend.title = element_text(size = 8), # legend title
+      plot.title = element_text(size = 8)) +   # plot title)+
+     facet_wrap(~experiment,nrow=1, labeller= label_wrap_gen(width = 15) )+
+    geom_text(data = lambda_estimates_df,aes(x=10,y=0.23,label = label),parse=F, size = 7, size.unit = "pt")+
+    scale_y_continuous(breaks = c(0,0.1,0.2,0.3),limits = c(0,0.25))
+
+Fig3a 
+```
+
+Look at results (pval<0.05 rejects poisson distribution)
+```{r}
+lambda_estimates_df %>% select(experiment,lam,std,chisq_value,pval_chisq)
+```
+
+
+I check that for dsDNA, I can recover it if I omit wild types
+```{r}
+
+fit <- fit_poisson_gfp(results_fitPoisson_gfp_data %>% filter(experiment=="dsDNA" & n_mutated_codons>0))
+cat("\ndsDNA removing wild type. X2=",fit$chisq_value,"and p-value=", fit$pval_chisq,"\n")
+
+```
+
+
+
+```{r}
+
+mutations_position_counts <- variantes_gfp_dna %>% 
+  select(name,mutations.codons,experiment) %>% 
+  mutate(mutations.codons = str_split(mutations.codons,";"))%>%
+  unnest() %>%
+  mutate(pos = as.numeric(str_sub(mutations.codons,4,-4)), 
+         codon_wt = str_sub(mutations.codons,1,3),
+         codon_mut = str_sub(mutations.codons,-3,-1),
+         targeted = mutations.codons %in% opools_GFP$mutations_codons) %>%
+  filter(!is.na(mutations.codons) ) %>%
+  mutate(aminoacid=plyr::mapvalues(codon_mut, from=names(codon_to_aa), to=codon_to_aa)) %>%
+  group_by(experiment, pos, aminoacid) %>%
+  summarise(counts_variants = n()) 
+paux <- sort(unique(mutations_position_counts$pos))
+opools_GFP <- opools_GFP %>% mutate(pos_plot = factor(pos_codon, levels=paux))
+mutations_position_counts <- mutations_position_counts %>% mutate(pos=factor(pos,level=paux))
+
+FigS6 <- ggplot(mutations_position_counts,aes(x=pos,y=aminoacid, fill=counts_variants))+
+  geom_tile()+
+  facet_grid(rows=vars(experiment))+
+  scale_fill_continuous(type = "viridis", name="Counts",    trans = "log10",
+    breaks =  10^(0:4),#trans_breaks("log10", function(x) 10^x),
+    labels = scales::trans_format("log10", scales::math_format(10^.x))
+)+
+  geom_point(data=opools_GFP, aes(x=pos_plot,y=aminoacid),inherit.aes = F,col="red")+
+  xlab("Position")+ylab("Amino acid")+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle=90,hjust = 1,vjust=0.5),
+        
+    legend.position = "left",
+    text = element_text(size = 14),         # overall text
+    axis.title = element_text(size = 12),   # axis labels
+    axis.text = element_text(size = 8),    # tick labels
+    legend.text = element_text(size = 8),  # legend labels
+    legend.title = element_text(size = 12), # legend title
+    plot.title = element_text(size = 14),strip.text = element_text(size = 10))
+FigS6
+
+```
+
+
+```{r}
+gfp_muts_comp <- mutations_position_counts %>% ungroup() %>%
+  pivot_wider(names_from = experiment, values_from = counts_variants)%>% 
+  select(-pos,-aminoacid)
+
+empty_diag_with_axes <- function(data, mapping, ...) {
+  x_var <- as.character(mapping$x)
+  ggplot(data, mapping) +
+    geom_blank() +
+    theme_minimal()
+}
+
+
+FigS7 <- GGally::ggpairs(
+  progress = FALSE,
+  data = gfp_muts_comp , 
+  upper = list(continuous = GGally::wrap("smooth", method = "lm", se = FALSE)),
+  lower = list(continuous = GGally::wrap("cor", size = 3)),
+  diag = list(continuous = empty_diag_with_axes),
+  columns = c("λ-exonuclease degradation","SPA + Beads purification","SPA + Gel purification","dsDNA")
+  )+
+  xlab("Mutations (counts)")+ylab("Mutations (counts)")+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle=90,vjust = 0.5,hjust=1),
+   text = element_text(size = 10),         # overall text
+    axis.title = element_text(size = 14),   # axis labels
+    axis.text = element_text(size = 12),    # tick labels
+    legend.text = element_text(size = 8),  # legend labels
+    legend.title = element_text(size = 8), # legend title
+    plot.title = element_text(size = 8))
+
+
+FigS7
+```
+
+
+How many exact variants are repeated in the different samples?
+```{r}
+variantes_gfp_dna %>% 
+  select(experiment, mutations.AA.from.codons) %>% 
+  group_by(experiment) %>% unique() %>% 
+  ungroup()%>% 
+  group_by(mutations.AA.from.codons) %>% 
+  summarise(n=n()) %>% arrange(-n) %>% 
+  group_by(n) %>% summarise(how_many_variants=n()) %>% 
+  dplyr::rename(in_how_many_samples = n)
+```
+
+
+
+## Activity
+
+```{r GFP activity}
+act_biot <- flowCore::read.FCS("data/Attune_SPABeads.fcs",emptyValue = F, transformation=FALSE)
+act_ds <- flowCore::read.FCS("data/Attune_dsDNA.fcs",emptyValue = F, transformation=FALSE)
+act_gel <- flowCore::read.FCS("data/Attune_SPAGel.fcs",emptyValue = F, transformation=FALSE)
+act_lambda <- flowCore::read.FCS("data/Attue_LambdaExo.fcs",emptyValue = F, transformation=FALSE)
+act_wt <- flowCore::read.FCS("data/Attune_Wildtype.fcs",emptyValue = F, transformation=FALSE)
+act_nc <- flowCore::read.FCS("data/Attune_NegativeControl.fcs",emptyValue = F, transformation=FALSE)
+
+
+df_act <- as.data.frame(flowCore::exprs(act_biot)) %>% mutate(experiment="SPA + Beads purification")%>% 
+        rbind( as.data.frame(flowCore::exprs(act_ds)) %>% mutate(experiment="dsDNA"))%>%
+        rbind( as.data.frame(flowCore::exprs(act_gel)) %>% mutate(experiment="SPA + Gel purification"))%>%
+        rbind( as.data.frame(flowCore::exprs(act_lambda)) %>% mutate(experiment="λ-exonuclease degradation"))%>%
+        rbind( as.data.frame(flowCore::exprs(act_wt)) %>% mutate(experiment="Wild type"))%>%
+        rbind( as.data.frame(flowCore::exprs(act_nc)) %>% mutate(experiment="Negative control"))
+
+rm(act_biot,act_ds,act_gel,act_lambda,act_wt,act_nc)
+gc(reset = T)
+
+
+
+mu_x <- log10(38000)
+mu_y <- log10(36000)
+r_log <- .4  # distance in log-log space
+
+df_act <- df_act %>% 
+  mutate(keep = (log10(`FSC-A`) - mu_x)^2 + (log10(`SSC-A`) - mu_y)^2 <= r_log^2) %>% 
+  filter(keep) %>%
+  select(experiment,`BL1-A`) %>% 
+  dplyr::rename(gfp_signal=`BL1-A`) %>%
+  mutate(exp=experiment)
+
+```
+
+
+```{r}
+# Split the data
+df_main <- df_act %>%
+  filter(!experiment %in% c("Wild type", "Negative control"))
+exp_values <- df_main$experiment %>% unique()
+
+df_controls <- df_act %>%
+  filter(experiment %in% c("Wild type", "Negative control")) %>%
+  mutate(exp=experiment)
+
+df_controls2 <- df_controls %>% 
+  mutate(experiment = exp_values[1]) %>%
+  rbind( df_controls %>% mutate(experiment = exp_values[2]))%>%
+  rbind( df_controls %>% mutate(experiment = exp_values[3]))%>%
+  rbind( df_controls %>% mutate(experiment = exp_values[4]))
+
+color_controls <- c("red","blue","yellow","green",grey(.5),grey(.9))
+names(color_controls) <- experiment_names
+
+# Plot
+plot_data <- rbind(df_main,df_controls2)
+
+
+legend_df <- data.frame(
+  x = c(1, 1, 1, 1, 1, 1),
+  y = c(0, 0, 0, 0, 0, 0),
+  type = c("Negative control", "Wild type",
+           "Library")
+)
+line_colors <- c(
+  "Negative control" = "gray50",
+  "Wild type" = "gray80",
+  "Library" = "blue"
+)
+
+line_types <- c(
+  "Negative control" = "dashed",
+  "Wild type" = "dashed",
+  "Library" = "solid"
+)
+
+
+Fig3A_act <- ggplot(plot_data, aes(x = gfp_signal, color = exp)) +
+  scale_x_log10(
+      labels = trans_format("log10", math_format(10^.x)),
+      minor_breaks = c(10^1,10^3,10^5)
+  ) +
+  facet_wrap(~experiment, nrow = 1) +
+  geom_density(data = plot_data %>% filter(exp%in% c("Wild type","Negative control")),
+               fill = NA, bw = 0.1,linetype='dashed',show.legend = F) +
+    scale_color_manual(values = color_controls)+
+  # Add controls with manual color/dashed lines
+  geom_density(data = plot_data %>% filter(! exp%in% c("Wild type","Negative control")),
+               color="blue",show.legend = F)+
+  scale_y_continuous(breaks=c(0,1,2))+
+  labs(title = "Activity", x = "Fluorescence intensity", y = "Density") +
+  #dummy data for legend 
+  geom_line(data = legend_df,
+            aes(x = x, y = y, color = type, linetype = type),
+            show.legend = TRUE) +
+  scale_color_manual(name = "Sample", values = line_colors) +
+  scale_linetype_manual(name = "Sample", values = line_types) +
+  theme(legend.position = "bottom",
+        legend.margin = margin(t=0, b=0),
+        legend.background = element_rect(fill = NA),
+        legend.key.spacing.x = unit(.05, "npc"),
+        legend.text = element_text(size = 8),  # legend labels
+        legend.title = element_text(size = 8,margin = margin(r=15),face = 'bold'), # legend title
+    text = element_text(size = 10,color='black'),         # overall text
+    axis.title = element_text(size = 8),   # axis labels
+    axis.text = element_text(size = 8),    # tick labels
+    plot.title = element_text(size = 8))+
+    theme(
+    strip.text = element_blank(),       # remove text
+    strip.background = element_blank()  # remove gray background
+  )
+
+Fig3A_act
+```
+
+
+
+# Bst polymerase
+
+
+
+
+```{r }
+bst_amplicon <- "GAGGATCGAGATCTCNNNNNNNNNNGATCCCGCGAAATTAATACGACTCACTATAGGGGAATTGTGAGCGGATAACAATTCCCCTCTAGAAATAATTTTGTTTAACTTTAAGAAGGAGATATACAATGGTGACCGTCAAATTCAAATATAAAGGGGAGGAGAAAGAAGTCGATATTTCTAAAATTAAAAAAGTTTGGCGGGTTGGCAAAATGATCTCTTTCACCTATGATGACAATGGCAAAACAGGCAGAGGCGCTGTTAGCGAGAAAGATGCGCCGAAAGAACTGTTGCAAATGCTGGAAAAATCAGGCAAGAAGGGTACTGGATCGGGAGCGGCTGAAGAGGAAAAACCGCTTGAAGAAATGGAGTTTGCGATCGCGGATGAGGTTACGGAAGAAATGTTAGCCGATAAAGCAGCGCTGGTTGTGGAGGTCATGGAAGAGAATTACCACGATGCCCCGATCGTTGGCATCGCCTTAGTGAATGAACATGGACGATTCTTCCTGCGTCCGGAAACAGCACTTGCGTCCCCGCAGTTTAAGGCATGGTTGGCAGACGAAACGAAAAAAAAATCCATGTTCGATGCTAAACGTGCTATTGTAGCGCTGAAATGGAAAGGTATAGAACTGCGCGGGGTAGCATTTGATTTGCTGTTAGCAGCATATCTGTTAAACCCCGCCCAAGATGCCGGTGATGTTGCGGCCGTGGCTAAAATGAAACAGTATGAAGCTGTACGTTCCGACGAGGCCGTCTATGGCAAAGGAGCTAAAAGAGCCGTTCCTGATGAACCAGTACTGGCCGAGCATTTAGTGCGGAAAGCGGCGGCGATATGGGCACTGGAACGTCCATTCCTCGATGAGTTACGTAATAATGAACAGGATGAACTTCTGACGGAACTTGAGCAGCCTTTAGCAGCTATACTGGCTGAGATGGAATTCACGGGCGTTAAAGTCGATACTAAAAGATTGGAACAGATGGGTGAGGAGTTAGCCGAGCAACTTAAGGAGGTAGAGCAGCGGATCTATGAACTTGCTGGACAGGAATTTAATATTAACTCTCCAAAACAACTCGGCGTTATTCTCTTTGAAAAACTGCAACTTCCCGTTTTAAAAAAGACTAAAACTGGTTATAGCACCTCAGCTGACGTTTTGGAAAAATTGGCGCCGCATCATGAAATCGTAGAAAATATACTCCACTATCGACAACTGGGAAAATTACAAAGCACTTATATTGAAGGTCTTTTGAAAGTGGTACATCCGGATACGGGTAAAGTACATACTCGCTTCAATCAGGCATTAACCCAAACAGGCCGTCTTTCAAGCACAGAACCTAATCTGCAGAATATCCCCATACGCTTAGAAGAAGGACGCAAAATTCGTCAGGCATTCGTCCCGTCTGAACCCGATTGGCTGATTTTTGCCGCCGATTATTCTCAAATAGAATTACGCGTCTTGGCACATATCGCTGATGACGATAACCTGATAGAGGCGTTCCGTCGTGATCTGGATATCCATACGAAGACAGCGATGGATATTTTTCACGTATCGGAAGACGAAGTAACGGCTAATATGAGAAGACAGGCGAAGGCCGTTAATTTTGGCATTGTATATGGGATTTCCGATTACGGCCTTTCGCAAAACTTAAACATTACACGGAAAGAAGCAGCTGAATTCATAGAACGCTACTTCGAGTCGTTCCCCGGGGTGAAACGTTATATGGAGAATATAGTGCAGGAAGCAAAACAGAAAGGATATGTGACGACGCTGCTGCATCGTCGGCGCTACTTGCCCGATATTACCAGCCGCAATTTTAATGTACGTAGCTTTGCCGAACGAACTGCGATGAATACACCCATTCAAGGTTCGGCCGCGGACATTATTAAAAAAGCCATGATTGACCTGGCAGCGCGCCTGAAGGAAGAACGTTTACAAGCTCGCCTTCTGCTGCAGGTTCACGATGAACTGATTCTCGAGGCCCCGAAGGAGGAAATCGAACGGCTTTGCAAATTAGTCCCGGAAGTAATGGAACAAGCCGTTGAACTGCGTGTGCCTCTGAAAGTTGATTATCATTATGGTCCTACCTGGTACGATGCTAAGTAACTAGCTTTGAGATCCGGCTGCTAACAAAGCCCGAAAGGAAGCTGAGTTGGCTGCTGCCACCGCTGAGCAATAACTAGCATAACCCCTTGGGGCCTCTAAACGGGTCTTGAGGGGTTTTTTGCTGAAAGGAGGAACTNNNNNNNNNNATATCCGGA"
+bst_amplicon_str <- str_split(bst_amplicon,"")[[1]]
+
+orf_ini=126
+orf_end=2099
+bst_orf <- str_sub(bst_amplicon,orf_ini,orf_end)
+bst_orf_str <- bst_amplicon_str[orf_ini:orf_end]
+orf_length = length(bst_orf_str)
+amplicon_length<- length(bst_amplicon_str)
+load("../Bst_variants.Rdata")->a
+bst_variants <- read.table("data/BST_variants.txt", heade=T)
+oligo_list <- read.csv("data/BST_oligos.txt")
+targeted_mutations <- data.frame(mutation=c("T394C","T394H","R396H","R396Y","Q485H",
+                                            "F491H","F491Y","G492C","G492H","Y495H","S566C","F567Y",
+                                            "R570H","R570Y","N574C","N574H","I577Y","Q578Y")) %>%
+                                    mutate(aa_ref = str_sub(mutation,1,1), 
+                                           codon_pos=as.numeric(str_sub(mutation,2,-2)), 
+                                           aa_mut=str_sub(mutation,-1,-1))
+
+```
+
+
+```{r}
+bst_variants %>%
+  group_by(experiment) %>% summarise(n_clones=n())
+```
+```{r}
+bst_variants %>% 
+  select(experiment, mutations) %>%
+  group_by(experiment) %>% 
+  unique() %>%
+  summarise(n_different_variants=n())
+```
+
+```{r}
+result <- oligo_list %>%
+  mutate(muttype = ifelse(str_detect(V1,"Sg"),"single","double"))%>%
+  select(targeted_mutations,muttype) %>%
+  crossing(experiment = unique(bst_variants$experiment)) %>%
+  rowwise()%>%
+  mutate(
+    counts =ifelse(muttype=="single", 
+                  sum(bst_variants$mutations[bst_variants$experiment == experiment]==targeted_mutations),
+                  sum(str_detect(bst_variants$mutations[bst_variants$experiment == experiment],targeted_mutations))
+    )
+  ) %>%
+  group_by(experiment) %>% mutate(proportion = counts/sum(counts)) %>%
+  mutate(mut_observed=counts>0)
+
+```
+
+
+```{r}
+df.bst <- result %>% 
+  ungroup() %>%
+  filter(muttype=='double') %>%
+  mutate(mut1 = str_split_i(targeted_mutations,"-",1), 
+         mut2 = str_split_i(targeted_mutations,"-",2) 
+         ) %>%
+  select(targeted_mutations,mut1,mut2,counts,mut_observed,experiment) %>%
+  mutate(pos1 = as.numeric(str_sub(mut1,2,-2)),
+         pos2 = as.numeric(str_sub(mut2,2,-2))
+         ) %>%
+  mutate(targeted=TRUE)
+
+
+levels  <- unique(c(df.bst$mut1,df.bst$mut2))
+levels <- levels[order(as.numeric(str_sub(levels,2,-2)))]
+
+levels1  <- unique(c(df.bst$mut1))
+levels1 <- levels1 [order(as.numeric(str_sub(levels1,2,-2)))]
+
+levels2  <- unique(c(df.bst$mut2))
+levels2 <- levels2 [order(as.numeric(str_sub(levels2,2,-2)))]
+
+df.bst <- df.bst %>%
+  mutate(mut1 = factor(mut1,levels = levels), 
+         mut2 = factor(mut2,levels = levels), 
+         )
+```
+
+```{r}
+singleLib_closeMut <- bst_variants %>% 
+  filter(experiment=="oPool Single 5:1" & nchar(mutations)>7) %>%
+  mutate(dist = as.numeric(str_sub(mutations,2,4))-as.numeric(str_sub(mutations,8,10))) %>%
+  filter(abs(dist)<11) %>% 
+  mutate(mut1 = str_split_i(mutations,"-",1), 
+         mut2 = str_split_i(mutations,"-",2) 
+         ) %>%
+  mutate(mut1 = factor(mut1,levels = levels), 
+         mut2 = factor(mut2,levels = levels), 
+         ) %>%
+  filter(!is.na(mut2) & !is.na(mut1) & dist!=0) %>%
+  filter(!mutations %in% df.bst$targeted_mutations[df.bst$experiment=="oPool Single 5:1" & df.bst$mut_observed])
+
+
+
+  
+```
+
+
+```{r}
+doubleLib_closeMut <- bst_variants %>% 
+  filter(experiment=="oPool Mix 5:1" & nchar(mutations)>7) %>%
+  mutate(dist = as.numeric(str_sub(mutations,2,4))-as.numeric(str_sub(mutations,8,10))) %>%
+  filter(abs(dist)<11) %>% 
+  mutate(mut1 = str_split_i(mutations,"-",1), 
+         mut2 = str_split_i(mutations,"-",2) 
+         ) %>%
+  mutate(mut1 = factor(mut1,levels = levels), 
+         mut2 = factor(mut2,levels = levels), 
+         ) %>%
+  filter(!is.na(mut2) & !is.na(mut1) & dist!=0)%>%
+  filter(!paste0(mut1,"-",mut2) %in% df.bst$targeted_mutations[df.bst$experiment=="oPool Mix 5:1" & df.bst$mut_observed])
+
+  
+```
+
+
+```{r}
+Fig3B <- ggplot(df.bst, aes(x=mut1, y=mut2, fill=targeted))+
+  geom_tile()+
+  geom_tile(aes(x=mut2,y=mut1))+
+  scale_x_discrete(drop = FALSE) +
+  scale_y_discrete(drop = FALSE)+
+  xlab('5\' mutation ')+
+  ylab('3\' mutation')+
+  theme(
+    panel.border = element_rect(),
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1), 
+     )+
+  geom_point(data = df.bst %>% filter(experiment=="oPool Mix 5:1" & mut_observed), 
+             aes(x=mut1,y=mut2,col=experiment,shape=experiment))+ 
+  geom_point(data = df.bst %>% filter(experiment=="oPool Single 5:1" & mut_observed), 
+             aes(x=mut2,y=mut1,col=experiment,shape=experiment))+coord_fixed()+#guides(fill = "none")+ 
+  scale_fill_manual(
+    name = NULL,
+    values = c("TRUE" = "grey85"),
+    labels = c("TRUE" = "Targeted mutation")
+  ) +
+  scale_shape_manual(
+    name = NULL,
+    values = c("oPool Single 5:1"=4,"oPool Mix 5:1" = 4),
+    labels = c("oPool Single 5:1" = "Single mutation primers","oPool Mix 5:1"="Double mutation primers")
+  ) +
+  scale_color_manual(
+    name = NULL,
+    values = c("oPool Single 5:1"="red","oPool Mix 5:1" = "blue"),
+    labels = c("oPool Single 5:1" = "Single mutation primers","oPool Mix 5:1"="Double mutation primers")
+  )+
+  guides(
+    fill  = guide_legend(order = 1, override.aes = list(shape = 22,color = NA,stroke = 0)),
+    color = guide_legend(order = 2),
+    shape  = guide_legend(order = 2)
+  )+
+  geom_vline(
+    xintercept = c(4.5, 10.5),
+    color = grey(0.5),
+    linewidth = 0.5, linetype='dashed'
+  )+
+  geom_hline(
+    yintercept = c(4.5, 10.5),
+    color = grey(0.5),
+    linewidth = 0.5, linetype='dashed'
+  )+
+  theme(legend.position = "inside",
+        legend.position.inside = c(0.28,0.88),
+        legend.box.spacing = unit(0.08, "cm"),
+        legend.spacing.y = unit(0.04, "cm"),
+        legend.key.height = unit(0.4, "cm")
+)+
+  geom_point(inherit.aes = F,data=singleLib_closeMut, aes(x=mut2,y=mut1,col=experiment,shape=experiment))+
+  geom_point(inherit.aes = F,data=doubleLib_closeMut, aes(x=mut1,y=mut2,col=experiment,shape=experiment))
+
+
+Fig3B
+```
+
+**Figure 3**
+```{r}
+Fig3 <- ggarrange(
+  ggarrange(Fig3a+ggtitle("Mutations")+theme(plot.title = element_text(face = "bold")),
+           Fig3A_act+theme(plot.margin = margin(l=.025,r=0.01,unit = "npc"),
+                           plot.title = element_text(face = "bold")),
+            ncol=1,heights = c(1.3,1)*0.5), 
+  Fig3B + theme(legend.position.inside = c(0.26,0.78),   legend.spacing.y = unit(0.4, "cm"),legend.title.margin = margin(b = 0)), 
+  ncol = 2,labels = "AUTO", widths = c(1,0.65), heights = c(1,1))
+
+Fig3
+```
+
+Variants with double mutants in the Single library
+```{r}
+bst_variants %>% 
+  filter(experiment=="oPool Single 5:1") %>%
+  mutate(dist = as.numeric(str_sub(mutations,2,4))-as.numeric(str_sub(mutations,8,10))) %>%
+  filter(abs(dist)<11 & dist !=0) %>%
+  arrange(mutations)
+```
+
+Out of the 34 double mutants targeted, only 2 appear in the single mutants library.
+In the _doubles library_, 8 double mutants are missing.
+In the mix, all of them appear. 
+
+
+```{r Fisher test}
+# Contingency table
+fisher_mat <- matrix(
+  c(3, 31,
+    34, 0),
+  nrow = 2,
+  byrow = TRUE
+)
+
+rownames(fisher_mat) <- c("Single", "Mix")
+colnames(fisher_mat) <- c("Observed", "Not_observed")
+
+fisher_mat
+
+# Fisher exact test
+fisher.test(fisher_mat)
+
+```
+
+What are the chances of getting the Single Mut. distribution by subsampling the Single+Double mut. results?
+Test by subsampling:
+```{r Test Size}
+sample_size <- 142
+for(i in 1:10000){
+  #Take a smaller set of the Mix oPool (the size of the single oPool)
+  variants_subset <- bst_variants %>%  
+    filter(experiment=="oPool Mix 5:1")%>%
+    slice_sample(n = sample_size,replace = FALSE) %>%
+    ungroup()
+
+  result_subset <- oligo_list %>%
+    mutate(muttype = ifelse(str_detect(V1,"Sg"),"single","double"))%>%
+    select(targeted_mutations,muttype) %>%
+    rowwise()%>%
+    mutate(
+      counts =ifelse(muttype=="single", 
+                    sum(variants_subset$mutations==targeted_mutations),
+                    sum(str_detect(variants_subset$mutations,targeted_mutations))
+      )
+    ) %>%
+    filter(counts>0) %>% 
+    group_by(muttype) %>% 
+    summarise(n_mutants=n()) %>% 
+    mutate(run_subset_ID=i)
+
+  if(i ==1){
+    res_bootstraping <-   result_subset
+  }else{
+    res_bootstraping <-   res_bootstraping %>% 
+      rbind(result_subset)
+  }
+}
+
+```
+
+
+
+How many times we obtain less than 3 double mutants?  
+None. So prob is less than 0.001
+```{r}
+res_bootstraping%>% 
+  filter(muttype=="double") %>%
+  filter(n_mutants<=3) 
+```
+
+
+
