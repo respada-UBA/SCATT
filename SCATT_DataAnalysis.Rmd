@@ -17,11 +17,12 @@ This notebook contains the analysis of our data.
 
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = FALSE,warning = FALSE, eval=TRUE)
+knitr::opts_chunk$set(echo = TRUE,warning = FALSE, eval=TRUE)
 ```
 
 ```{r Packages}
 suppressMessages(require(Biostrings,quietly = T,warn.conflicts = F))
+suppressMessages(require(pwalign,warn.conflicts = F))
 
 suppressMessages(library(Rsamtools))
 suppressMessages(library(GenomicAlignments))
@@ -101,6 +102,11 @@ detect_codon  <- function(n){
   if(n%%3==1){y <- n+c(0:2)}
   if(n%%3==2){y <- n+c(-1:1)}
   if(n%%3==0){y <- n+c(-2:0)}
+  return(y)
+}
+
+codonId <- function(n){
+  y <- round((n-2)/3)+1
   return(y)
 }
 
@@ -240,7 +246,7 @@ filter_synonymus <- function(x){
 
 #Labels for facets
 custom_labeller <- function(value) {
-  paste0("oligos to template ratio: ", value)
+  paste0("Ratio: ", value)
 }
 
 #IUPAC code mapping
@@ -274,6 +280,123 @@ match_iupac <- function(base, mutated_base) {
   return(base %in% valid_bases)
 }
 
+# Detect non-canonical bases in sequence
+detect_noncanonical <- function(seq, read_name) {
+    seq_chars <- strsplit(as.character(seq), "")[[1]]
+    canonical <- c("A", "C", "G", "T")
+    bad_positions <- which(!(seq_chars %in% canonical))
+    if (length(bad_positions) == 0) {
+        return(NULL)
+    }
+    data.frame(
+        read_id = read_name,
+        position = bad_positions,
+        noncanonical_base = seq_chars[bad_positions]
+    )
+}
+
+# Detect mutations and InDels
+detect_variants <- function(alignment, read_name) {
+    aligned_ref  <- as.character(pattern(alignment))
+    aligned_read <- as.character(subject(alignment))
+    ref_chars  <- strsplit(aligned_ref, "")[[1]]
+    read_chars <- strsplit(aligned_read, "")[[1]]
+    results <- data.frame()
+    ref_pos <- 0
+    i <- 1
+    while (i <= length(ref_chars)) {
+
+        ref_base  <- ref_chars[i]
+        read_base <- read_chars[i]
+
+        # INSERTIONS
+        if (ref_base == "-" && read_base != "-") {
+            start_pos <- ref_pos
+            inserted <- c()
+            while (i <= length(ref_chars) &&
+                   ref_chars[i] == "-") {
+                inserted <- c(inserted, read_chars[i])
+                i <- i + 1
+            }
+            inserted_seq <- paste(inserted, collapse="")
+            results <- bind_rows(
+                results,
+                data.frame(
+                    read_id = read_name,
+                    variant_type = "insertion",
+                    ref_position = start_pos,
+                    ref_sequence = "-",
+                    alt_sequence = inserted_seq,
+                    length = nchar(inserted_seq)
+                )
+            )
+            next
+        }
+
+        # DELETIONS
+        if (read_base == "-" && ref_base != "-") {
+            start_pos <- ref_pos + 1
+            deleted <- c()
+            while (i <= length(read_chars) &&
+                   read_chars[i] == "-") {
+
+                deleted <- c(deleted, ref_chars[i])
+
+                ref_pos <- ref_pos + 1
+                i <- i + 1
+            }
+            deleted_seq <- paste(deleted, collapse="")
+            results <- bind_rows(
+                results,
+                data.frame(
+                    read_id = read_name,
+                    variant_type = "deletion",
+                    ref_position = start_pos,
+                    ref_sequence = deleted_seq,
+                    alt_sequence = "-",
+                    length = nchar(deleted_seq)
+                )
+            )
+            next
+        }
+
+
+        # SNVs
+        if (ref_base != "-") {
+            ref_pos <- ref_pos + 1
+        }
+        if (ref_base != "-" &&
+            read_base != "-" &&
+            ref_base != read_base) {
+            results <- bind_rows(
+                results,
+                data.frame(
+                    read_id = read_name,
+                    variant_type = "SNV",
+                    ref_position = ref_pos,
+                    ref_sequence = ref_base,
+                    alt_sequence = read_base,
+                    length = 1
+                )
+            )
+        }
+
+        i <- i + 1
+    }
+    return(results)
+}
+
+get_pairs <- function(mutation_string, experiment) {
+  muts <- unlist(strsplit(mutation_string, ";"))
+  pairs <- combn(muts, 2, simplify = FALSE)
+  
+  tibble(
+    experiment = experiment,
+    mutation_pair = sapply(pairs, function(x){ paste(x, collapse = ";")})
+  )
+}
+
+
 ```
 
 
@@ -281,12 +404,17 @@ match_iupac <- function(base, mutated_base) {
 
 Load data and define relevant variables
 
-```{r NBIreference}
+```{r NBI Load references}
 # Colors for plots
+exp <- c(1,3,5,10)
 colors_exp <- c("red","darkgreen","blue","orange") 
 names(colors_exp) <- c("1","3","5","10")
-
+expIDs <- c("λ = 0.8","λ = 3.1","λ = 7.1","λ = 11.9")
+names(colors_exp) <- expIDs
 #Sequence
+reference_fasta <- "/home/rocio/202412_SCATT_Demux2/NBIampSCATT.fasta"
+ref_seq <- DNAString("TACCATGCTAAGGAATTACAGCTAGAACTCAAAAAGAAAAAGTTACAAGCAGATTTTAATGACCCACGTCAACTTGAAGAAGTCATTGACCTTCTTGAGGTATATCATGAGAAAAAGAATGTGATTGAAGAGAAAATTAAAGCTCGCTTCATTGCAAATAAAAATACTGTATTTGAATGGCTTACGTGGAATGGCTTCATTATTCTTGGAAATGCTTTAGAATATAAAAACAACTTCGTTATTGATGAAGAGTTACAACCAGTTACTCATGCCGCAGGTAACCAGCCTGATATGGAAATTATATATGAAGACTTTATTGTTCTTGGTGAAGTAACAACTTCTAAGGGAGCAACCCAGTTTAAGATGGAATCAGAACCAGTAACAAGGCATTATTTAAACAAGAAAAAAGAATTAGAAAAGCAAGGAGTAGAGAAAGAACTATATTGTTTATTCATTGCGCCAGAAATCAATAAGAATACTTTTGAGGAGTTTATGAAATACAATATTGTTCAAAACACAAGAATTATCCCTCTCTCATTAAAACAGTTTAACATGCTCCTAATGGTACAGAAGAAATTAATTGAAAAAGGAAGAAGGTTATCTTCTTATGATATTAAGAATCTGATGGTCTCATTATATCGAACAACTATAGAGTGTGAAAGAAAATATACTCAAATTAAAGCTGGTTTAGAAGAAACTTTAAATAATTGGGTTGTTGACAAGGAGGTAAGGTTTCCATGGCACCACCACCACCACCACCACCACCCATGG")
+ref_seq_ORF <- ref_seq[31:741]
 nbi_ref_dna <- toupper("aaaaagaaaaagttacaagcagattttaatgacccacgtcaacttgaagaagtcattgaccttcttgaggtatatcatgagaaaaagaatgtgattgaagagaaaattaaagctcgcttcattgcaaataaaaatactgtatttgaatggcttacgtggaatggcttcattattcttggaaatgctttagaatataaaaacaacttcgttattgatgaagagttacaaccagttactcatgccgcaggtaaccagcctgatatggaaattatatatgaagactttattgttcttggtgaagtaacaacttctaagggagcaacccagtttaagatggaatcagaaccagtaacaaggcattatttaaacaagaaaaaagaattagaaaagcaaggagtagagaaagaactatattgtttattcattgcgccagaaatcaataagaatacttttgaggagtttatgaaatacaatattgttcaaaacacaagaattatccctctctcattaaaacagtttaacatgctcctaatggtacagaagaaattaattgaaaaaggaagaaggttatcttcttatgatattaagaatctgatggtctcattatatcgaacaactatagagtgtgaaagaaaatatactcaaattaaagctggtttagaagaaactttaaataattgggttgttgacaaggaggtaaggtttccatgg")
 ref_prot_NBI <- Biostrings::translate(DNAString(nbi_ref_dna))
 ref_prot_str_NBI <- str_split(as.character(ref_prot_NBI),"")[[1]]
@@ -305,56 +433,70 @@ opools_NBI <- read.table("data/NBI_oligos.txt") %>%
   mutate(tm_simple = 2*(str_count(oligo,"A")+str_count(oligo,"T"))+4*(str_count(oligo,"G")+str_count(oligo,"C")))
 ```
 
-Load sequences
 
-```{r NBI load}
-variantes_nbi_dna <- read.table("data/NBI_variants.txt", header=T)
+Load NBI data
+
+```{r NBI Load data}
+nbi_Indels <- read.table("data/NBI_InDels.txt")
+variants_nbi_dna <- read.table("data/NBI_variants.txt", header=T)
+
+variants_nbi_dna <- variants_nbi_dna %>%  
+                      mutate(libraryID = case_when(
+                        library==1~ expIDs[1],
+                        library==3~ expIDs[2],
+                        library==5~ expIDs[3],
+                        library==10~ expIDs[4]))
+    
+nbi_Indels <- nbi_Indels %>%  
+                      mutate(libraryID = case_when(
+                        library==1~ expIDs[1],
+                        library==3~ expIDs[2],
+                        library==5~ expIDs[3],
+                        library==10~ expIDs[4]))
+    
+
+```
+
+How many total variants
+```{r NBI Count total variants}
+nbi_total_variants <- full_join(nbi_Indels %>%
+                                  group_by(libraryID)%>% 
+                                  select(read_id) %>% 
+                                  unique() %>% 
+                                  summarise(counts=n()), 
+                                variants_nbi_dna %>%
+                                  group_by(libraryID) %>%
+                                  select(name) %>% 
+                                  unique()%>% 
+                                  summarise(counts=n()),
+                                by = "libraryID") %>%
+                      mutate(total_variants = counts.x+counts.y) %>%
+                      select(-counts.x,-counts.y)
+print(nbi_total_variants)
 ```
 
 
-We explored some statistics of the libraries.
-
-How many sequences have the wrong length, meaning have InDels?
-```{r NBI wrong length}
-table_wrong_length <- variantes_nbi_dna %>% 
-  mutate(wrong_length = muts=='wrong length') %>%
-  group_by(experiment,wrong_length)%>%
-  summarise(is_wrong_length = n()) %>% 
-  mutate(wrong_length = ifelse(wrong_length,'wrong','right')) %>%
-  pivot_wider(names_from =  wrong_length,values_from = is_wrong_length) %>%
-  mutate(percentage_wrong = wrong / (right+wrong)*100)
-
-FigS1a <- ggplot(table_wrong_length, 
-                            aes(x=as.factor(experiment),y=percentage_wrong))+
-  geom_bar(stat = 'identity')+ theme(
-    text = element_text(size = 10),         # overall text
-    axis.title = element_text(size = 10),   # axis labels
-    axis.text = element_text(size = 10),    # tick labels
-    legend.text = element_text(size = 10),  # legend labels
-    legend.title = element_text(size = 10), # legend title
-    plot.title = element_text(size = 10)    # plot title
-  )+ 
-  xlab("oPool to template ratio")+ylab("Wrong length (%)")
-
-table_wrong_length
-```
-
+## FigS1: Wild type sequences in each library
 How many sequences are the wild type sequence, meaning there was no mutations?
-```{r NBI wild types}
-table_wildtpes<- variantes_nbi_dna %>% 
-  filter(muts!='wrong length')%>%
+```{r NBI count wild types}
+table_wildtpes <- variants_nbi_dna %>% 
   mutate(is_wt = n_mutated_codons==0  )%>%
-  group_by(experiment,is_wt) %>%
+  group_by(libraryID,is_wt) %>%
   summarise(n = n()) %>% 
   mutate(is_wildtype = ifelse(is_wt,'wildtype','variant')) %>%
   select(-is_wt)%>%
   pivot_wider(names_from =  is_wildtype,values_from = n) %>%
-  mutate(percentage_wildtype = round(wildtype / (variant+wildtype)*100,1))
+  mutate(percentage_wildtype = round(wildtype / (variant+wildtype)*100,1)) %>%
+  mutate(libraryID = factor(libraryID,levels=expIDs))
+
+
 
 table_wildtpes
 
-FigS1b <- ggplot(table_wildtpes, aes(x=as.factor(experiment),y=percentage_wildtype))+
-  geom_bar(stat = 'identity')+ theme(
+FigS1 <- ggplot(table_wildtpes, aes(x=libraryID,y=percentage_wildtype))+
+  geom_bar(stat = 'identity')+ 
+ # geom_text(aes(label=paste(percentage_wildtype,"%"), y =percentage_wildtype+1))+
+  theme(
     text = element_text(size = 10),         # overall text
     axis.title = element_text(size = 10),   # axis labels
     axis.text = element_text(size = 10),    # tick labels
@@ -363,36 +505,141 @@ FigS1b <- ggplot(table_wildtpes, aes(x=as.factor(experiment),y=percentage_wildty
     plot.title = element_text(size = 10)    # plot title
   )+
   xlab("oPool to template ratio")+ylab("Wild type (%)")
-```
 
-
-
-**FigS1**
-```{r FigS1}
-FigS1 <- ggarrange(FigS1a,FigS1b,labels = "AUTO",ncol=2)
 FigS1
 ```
 
+## Fig S6: Wrong length by library
+```{r NBI count InDels}
+table_wrong_length <- nbi_Indels %>% 
+  filter(variant_type!="SNV")%>%
+  group_by(libraryID) %>%
+  summarise(var_with_InDels =n()) %>%
+  left_join(nbi_total_variants, by="libraryID") %>%
+  mutate(percentage_with_InDels = round(var_with_InDels/total_variants*100,1)) %>%
+  mutate(libraryID = factor(libraryID,levels=expIDs))
+
+
+plot_wronglength <- ggplot(table_wrong_length, 
+                            aes(x=libraryID,y=percentage_with_InDels))+
+  geom_bar(stat = 'identity')+ 
+  #geom_text(aes(label=paste(percentage_with_InDels,"%"), y =percentage_with_InDels+0.2))+
+  theme(
+    text = element_text(size = 10),         # overall text
+    axis.title = element_text(size = 10),   # axis labels
+    axis.text = element_text(size = 10),    # tick labels
+    legend.text = element_text(size = 10),  # legend labels
+    legend.title = element_text(size = 10), # legend title
+    # plot.title = element_text(size = 10)    # plot title
+  )+ xlab("oPool to template ratio")+ylab("Wrong length (%)")
+plot_wronglength
+
+```
+
+
+
+```{r NBI plot Indel per pos}
+plot_IndelsPos <- ggplot(nbi_Indels %>% filter(variant_type!="SNV"), aes(x=ref_position, fill=variant_type))+
+  geom_histogram(binwidth = 5)+
+  ggtitle("Location of InDels in NBI libraries")+
+  xlab("Position")+ylab("Counts")+
+  scale_fill_manual(values = c("lightblue","orange"), labels = c("Deletion", "Insertion"), name="InDel type")+
+  theme(legend.position = "inside", legend.position.inside = c(0.8,0.9))
+plot_IndelsPos
+```
+
+```{r NBI compute distance Del to mutations}
+deletions_with_distance <- nbi_Indels %>% filter(variant_type=="deletion") %>%
+    rowwise() %>%
+    mutate(
+        closest_snv_distance = {
+            current_read <- read_id
+            current_pos <- ref_position
+            # SNVs only from same read
+            snv_positions <-  nbi_Indels %>%
+                filter(read_id == current_read)%>%
+                filter(variant_type=="SNV") %>%
+                pull(ref_position)
+            # No SNVs
+            if (length(snv_positions) == 0) {
+                NA_real_
+            } else {
+                min(abs(snv_positions - current_pos))
+            }
+        }
+    ) %>%
+    ungroup()
+
+deletions_with_distance <- deletions_with_distance%>%  
+                      mutate(libraryID = case_when(
+                        library==1~ expIDs[1],
+                        library==3~ expIDs[2],
+                        library==5~ expIDs[3],
+                        library==10~ expIDs[4]))%>%
+  mutate(libraryID = factor(libraryID,levels=expIDs))
+
+```
+
+
+
+Percentage of deletions closer than 12 bases to a mutation. It increases for larger mutation load.
+So I think we have approx 3% error from sequencing, mainly on the sides of the mutagenic region, and it increases with number of oligos (which carry some errors)
+```{r NBI compute percentage of close Del to mutations}
+df_distDelSNV <- deletions_with_distance %>% 
+  group_by(libraryID) %>%
+  summarise(less_12 = sum(closest_snv_distance<13,na.rm=T),
+         counts=n()) %>%
+  mutate(percentage_less12 = round(less_12/counts*100,1))
+  df_distDelSNV
+```
+
+```{r NBI plot distance Del to mutations}
+plot_dist_DelSNV <- ggplot(deletions_with_distance %>% filter(!is.na(closest_snv_distance)),
+       aes(x=closest_snv_distance,y=after_stat(count),fill=as.factor(libraryID)))+
+  geom_histogram(binwidth = 1)+
+  geom_text(data = df_distDelSNV %>% mutate(xpos = 8, ypos=c(20,30,100,150)),
+            aes(x=xpos,y=ypos,label =paste0(percentage_less12,"%")))+
+  facet_grid(libraryID~., scales = "free_y") +
+  geom_vline(xintercept = 12, linetype="dashed", color=grey(0.5))+
+  coord_cartesian(xlim=c(0,50))+
+  scale_y_continuous(n.breaks=3)+
+  ggtitle("Closest mutation from deletion")+
+  scale_fill_discrete(palette = colors_exp, name="Library")+
+  xlab("Distance deletion to closest mutation [bases]")+ylab("Counts")+theme(legend.position = "none")
+
+plot_dist_DelSNV
+```
+
+
+Fig S6
+```{r Fig S6}
+FigS6 <- ggarrange(ggarrange(plot_wronglength,plot_IndelsPos,ncol = 2,widths = c(0.7,1),labels = c("A","B")), plot_dist_DelSNV,ncol = 1,heights = c(1,1.2),labels = c("","C"))
+FigS6
+```
+
+
+## Distribution of SNVs
 We studied the distribution of mutations per variant (Fig 2A)
 
 ```{r NBI muts distr}
-mutations_distribution <- variantes_nbi_dna %>% 
-    filter(muts!='wrong length') %>% 
-  group_by(experiment,n_mutated_codons) %>%
+mutations_distribution <- variants_nbi_dna %>% 
+  group_by(libraryID,library,n_mutated_codons) %>%
   summarise(counts = n()) %>%
-  group_by(experiment) %>%
-  mutate(proportion = counts/sum(counts))
+  group_by(libraryID,library) %>%
+  mutate(proportion = counts/sum(counts)) %>%
+  mutate(libraryID = factor(libraryID,levels=expIDs))
+
 
 # Apply the fitting function to each experiment
 results_fitPoisson <- mutations_distribution %>%
-  group_by(experiment) %>%
+  group_by(libraryID) %>%
   group_split() %>%
   map(fit_poisson)
 
 # Combine the results
 all_data <- bind_rows(map(results_fitPoisson, "data"))
 fit_qual = data.frame(
-  experiment = c(1,3,5,10),
+  libraryID = expIDs,
   lambda_est = map_dbl(results_fitPoisson, "lambda"),
   std_error = map_dbl(results_fitPoisson, "std_error"),
   t_value=map_dbl(results_fitPoisson, "t_value"),
@@ -405,19 +652,10 @@ fit_qual = data.frame(
 
 lambda_estimates <- round(fit_qual$lambda_est,c(2,1,1,1))
 lambda_std <- round(fit_qual$std_error,c(2,1,1,1))
-names(lambda_estimates) <- unique(mutations_distribution$experiment)
-names(lambda_std) <- unique(mutations_distribution$experiment)
+names(lambda_estimates) <- unique(mutations_distribution$library)
+names(lambda_std) <- unique(mutations_distribution$library)
 
-lambda_estimates_df = data.frame(experiment = c(1,3,5,10),lam = lambda_estimates, std=lambda_std)
-
-lambda_labels <- tibble(
-  experiment = unique(all_data$experiment),
-  label = paste0("Experiment: ", unique(all_data$experiment), "\nλ = ", round(lambda_estimates, 3))
-)
-
-all_data <- all_data %>%
-  left_join(lambda_labels, by = "experiment") %>%
-         mutate(label = factor(label, levels=c("Experiment: NBIr1\nλ = 0.777","Experiment: NBIr3\nλ = 2.661","Experiment: NBIr5\nλ = 6.139","Experiment: NBIr10\nλ = 10.369","Experiment: NBIr3recJf\nλ = 0.752","Experiment: NBIr1recJf\nλ = 0.224")))
+lambda_estimates_df = data.frame(libraryID = expIDs,library=exp,lam = lambda_estimates, std=lambda_std)%>%  mutate(libraryID = factor(libraryID,levels=expIDs))
 
 mutations_distribution <- all_data
 rm(all_data)
@@ -425,9 +663,9 @@ rm(all_data)
 # Plot results
 lambda_estimates_df$label = paste0("\u03BB=", format(round(lambda_estimates_df$lam,1), nsmall = 1), " \u00B1 ", format(round(lambda_estimates_df$std,1), nsmall = 1))
   
-Fig2A <- ggplot(mutations_distribution , aes(x = n_mutated_codons)) +
+Fig1B <- ggplot(mutations_distribution , aes(x = n_mutated_codons)) +
   geom_bar(aes(y = proportion),fill=grey(.3), stat = "identity", alpha = 0.5, width = 0.8) +
-  geom_line(aes(y = predicted, color = as.factor(experiment)))+#, linetype = "dashed") +
+  geom_line(aes(y = predicted, color = libraryID))+#, linetype = "dashed") +
   labs(
     x = "Number of Mutations Per Variant",
     y = "Proportion"
@@ -439,71 +677,71 @@ Fig2A <- ggplot(mutations_distribution , aes(x = n_mutated_codons)) +
     legend.text = element_text(size = 10),  # legend labels
     legend.title = element_text(size = 10), # legend title
     plot.title = element_text(size = 10))+    # plot title)+
-  facet_wrap(~experiment,nrow=1, labeller = as_labeller(custom_labeller))+
+  facet_wrap(~library,nrow=1, labeller = as_labeller(custom_labeller))+
   scale_color_manual(values = colors_exp)+
   geom_text(data = lambda_estimates_df,aes(x=10,y=0.4,label = label),parse=F)+
   xlim(c(-1,18))
 
-Fig2A
+Fig1B
 
 ```
 
 Statistical test to indicate that our experimental data actually follows a Poisson distribution
 
 ```{r chitest}
-chisq.test(x = mutations_distribution %>% filter(experiment==1) %>% select(proportion,predicted), 
+chisq.test(x = mutations_distribution %>% filter(library==1) %>% select(proportion,predicted), 
            rescale.p=TRUE)
 
 
-chisq.test(x = mutations_distribution %>% filter(experiment==3) %>% select(proportion,predicted), 
+chisq.test(x = mutations_distribution %>% filter(library==3) %>% select(proportion,predicted), 
            rescale.p=TRUE)
 
 
-chisq.test(x = mutations_distribution %>% filter(experiment==5) %>% select(proportion,predicted), 
+chisq.test(x = mutations_distribution %>% filter(library==5) %>% select(proportion,predicted), 
            rescale.p=TRUE)
 
 
-chisq.test(x = mutations_distribution %>% filter(experiment==10) %>% select(proportion,predicted), 
+chisq.test(x = mutations_distribution %>% filter(library==10) %>% select(proportion,predicted), 
            rescale.p=TRUE)
 
 ```
 
 
 How many good-length variants are explored
-```{r}
-variantes_nbi_dna %>%
-  filter(muts!="wrong_lenth")%>%
-  group_by(experiment) %>%
-  summarise(analysed_clones = n())
+```{r NBI analysed variants}
+variants_nbi_dna %>%
+  group_by(libraryID) %>%
+  summarise(analysed_variants = n())
 ```
 
 How many non-wildtype, good-length variants are explored
-```{r}
-variantes_nbi_dna %>%
+```{r NBI count mutated variants}
+variants_nbi_dna %>%
   filter(!is.na(mutations.AA.from.codons)) %>% 
-  group_by(experiment) %>%
-  summarise(analysed_clones = n())
+  group_by(libraryID) %>%
+  summarise(analysed_variants = n())
 ```
 
-
-Which amino acids are explored in each position (I take only non-wildtye sequences and subset to 2778 - the minimum)
-```{r aa explored}
-nbi_explored_mutations <- variantes_nbi_dna %>%
+## FigS4
+Which amino acids are explored in each position (I take only non-wildtye sequences and subset to 6416 - the minimum)
+```{r NBI aa explored}
+nbi_explored_mutations <- variants_nbi_dna %>%
   filter(!is.na(mutations.AA.from.codons)) %>% 
-  group_by(experiment)%>%
-  slice_sample(n=2778) %>%
-  select(experiment,mutations.AA.from.codons) %>%
+  group_by(libraryID)%>%
+  slice_sample(n=6416) %>%
+  select(libraryID,mutations.AA.from.codons) %>%
   mutate(mutations.AA.from.codons.list = str_split(mutations.AA.from.codons,";")) %>%
   select(-mutations.AA.from.codons)%>%
   unnest() %>%
-  group_by(experiment,mutations.AA.from.codons.list) %>%
+  group_by(libraryID,mutations.AA.from.codons.list) %>%
   summarise(counts_variants=n())%>%
   mutate(Position = as.numeric(str_sub(mutations.AA.from.codons.list,2,-2)) ) %>%
   mutate(aa_original = str_sub(mutations.AA.from.codons.list,1,1)) %>%
   mutate(aa_explored = str_sub(mutations.AA.from.codons.list,-1,-1)) %>%
   arrange(Position,aa_explored) %>% 
   filter(Position>14) %>%
-  mutate(aa_explored = ifelse(aa_explored=="_","*", aa_explored))
+  mutate(aa_explored = ifelse(aa_explored=="_","*", aa_explored))%>% 
+  mutate(libraryID = factor(libraryID,levels=expIDs))
 
 FigS4 <- ggplot(nbi_explored_mutations,aes(x=Position,y=aa_explored, fill=counts_variants))+
   geom_tile()+
@@ -511,7 +749,7 @@ FigS4 <- ggplot(nbi_explored_mutations,aes(x=Position,y=aa_explored, fill=counts
   scale_x_continuous(expand = c(0, 0))+
   scale_fill_continuous(type = "viridis", name="Counts",    trans = "log10",
     labels = scales::trans_format("log10", scales::math_format(10^.x)))+
-    facet_wrap(~experiment,ncol=1,label=as_labeller(custom_labeller))+
+    facet_wrap(~libraryID,ncol=1)+
   theme(strip.background = element_blank(),          # removes box
     strip.text = element_text(hjust = 0), 
     text=element_text(size=20), 
@@ -522,30 +760,15 @@ FigS4 <- ggplot(nbi_explored_mutations,aes(x=Position,y=aa_explored, fill=counts
 )
 
 FigS4
-
 ```
 
 
 
-Fig2B - only 1x ratio
-```{r aa explored 2}
-nbi_explored_mutations_full10 <- variantes_nbi_dna %>%
-  filter(experiment==10) %>% 
-  filter(!is.na(mutations.AA.from.codons)) %>% 
-  select(experiment,mutations.AA.from.codons) %>%
-  mutate(mutations.AA.from.codons.list = str_split(mutations.AA.from.codons,";")) %>%
-  select(-mutations.AA.from.codons)%>%
-  unnest() %>%
-  group_by(experiment,mutations.AA.from.codons.list) %>%
-  summarise(counts_variants=n())%>%
-  mutate(Position = as.numeric(str_sub(mutations.AA.from.codons.list,2,-2)) ) %>%
-  mutate(aa_original = str_sub(mutations.AA.from.codons.list,1,1)) %>%
-  mutate(aa_explored = str_sub(mutations.AA.from.codons.list,-1,-1)) %>%
-  arrange(Position,aa_explored) %>% 
-  filter(Position>14) %>%
-  mutate(aa_explored = ifelse(aa_explored=="_","*", aa_explored))
+Fig1C - only 10x ratio
+```{r NBI a explored 2}
+nbi_explored_mutations_full10 <- nbi_explored_mutations %>% filter(libraryID=="λ = 11.9")
 
-Fig2B <- ggplot(nbi_explored_mutations_full10,aes(x=Position,y=aa_explored, fill=counts_variants))+
+Fig1C <- ggplot(nbi_explored_mutations_full10,aes(x=Position,y=aa_explored, fill=counts_variants))+
   geom_tile()+
   ylab("Explored mutations")+ 
   scale_x_continuous(expand = c(0, 0))+
@@ -553,7 +776,7 @@ Fig2B <- ggplot(nbi_explored_mutations_full10,aes(x=Position,y=aa_explored, fill
 
   scale_fill_continuous(type = "viridis", name="Counts",    trans = "log10",
     labels = scales::trans_format("log10", scales::math_format(10^.x)))+
-    facet_wrap(~experiment,ncol=1,label=as_labeller(custom_labeller))+
+   ggtitle("λ = 11.9")+
   theme(strip.background = element_blank(),          # removes box
     strip.text = element_text(hjust = 0), 
     text=element_text(size=10), 
@@ -567,44 +790,47 @@ Fig2B <- ggplot(nbi_explored_mutations_full10,aes(x=Position,y=aa_explored, fill
     legend.key.width = unit(0.3, "cm"),
     legend.position = "right",
     legend.margin = margin(0,0,0,0)) 
+
+Fig1C
 ```
 
 
 
 
-```{r explored per pos}
+```{r NBI explored per pos}
 nbi_explored_mutations_perpos <- nbi_explored_mutations %>% 
   filter(aa_original!=aa_explored) %>%
-  group_by(Position,experiment) %>%
+  group_by(Position,libraryID) %>%
   summarise(explored_mutations=n()) 
 ```
 
-```{r check1}
+```{r NBI check}
 nbi_explored_mutations_perpos %>%
   filter(Position>14) %>%
-  group_by(experiment) %>%
+  group_by(libraryID) %>%
   summarise(total_mutations = sum(explored_mutations)) %>%
   mutate(percentage_explored_mutation_from_all_possible = round(total_mutations/(20*223)*100,2))
 ```
 
-```{r aa explored counts}
-nbi_explored_mutations <- variantes_nbi_dna %>%
+##FigS5
+```{r NBI aa explored counts}
+nbi_explored_mutations <- variants_nbi_dna %>%
   filter(!is.na(mutations.AA.from.codons)) %>% 
-  select(experiment,mutations.AA.from.codons) %>%
+  select(libraryID,mutations.AA.from.codons) %>%
   mutate(mutations.AA.from.codons.list = str_split(mutations.AA.from.codons,";")) %>%
   select(-mutations.AA.from.codons)%>%
   unnest() %>%
-  group_by(experiment,mutations.AA.from.codons.list) %>%
+  group_by(libraryID,mutations.AA.from.codons.list) %>%
   summarise(counts_variants=n())%>%
   mutate(Position = as.numeric(str_sub(mutations.AA.from.codons.list,2,-2)) ) %>%
   mutate(aa_original = str_sub(mutations.AA.from.codons.list,1,1)) %>%
   mutate(aa_explored = str_sub(mutations.AA.from.codons.list,-1,-1)) %>%
   arrange(Position,aa_explored) %>% 
   filter(Position>14)%>% 
-  group_by(experiment,Position) %>%
+  group_by(libraryID,Position) %>%
   summarise(n=sum(counts_variants))
 FigS5 <- ggplot(nbi_explored_mutations,aes(x=Position, y=n))+
-  geom_point()+geom_line()+facet_wrap(~experiment,scales="free",ncol=1,label=as_labeller(custom_labeller))+
+  geom_point()+geom_line()+facet_wrap(~libraryID,scales="free",ncol=1)+
   ylab("Counts")+ggtitle("How many variants contain a mutation in a given position")+scale_y_continuous(n.breaks = 3)
 
 FigS5
@@ -614,32 +840,24 @@ FigS5
 
 How many joint amino acid mutations are explored?
 This code takes a few minutes, so results are provided in data/ and uploaded in next code block.
-```{r joint mutations, eval=FALSE}
-get_pairs <- function(mutation_string, experiment) {
-  muts <- unlist(strsplit(mutation_string, ";"))
-  pairs <- combn(muts, 2, simplify = FALSE)
-  
-  tibble(
-    experiment = experiment,
-    mutation_pair = sapply(pairs, function(x){ paste(x, collapse = ";")})
-  )
-}
-
+```{r NBI joint mutations, eval=TRUE}
 # Apply to each row
-nbi_pair_mutations <- variantes_nbi_dna %>% select(experiment,mutations.AA.from.codons,n_mutated_codons_rmsyn) %>% filter(n_mutated_codons_rmsyn>1) %>%
+nbi_pair_mutations <- variants_nbi_dna %>% select(libraryID,mutations.AA.from.codons,n_mutated_codons_rmsyn) %>%
+  filter(n_mutated_codons_rmsyn>1) %>%
   rowwise() %>%
-  do(get_pairs(.$mutations.AA.from.codons, .$experiment)) %>%
+  do(get_pairs(.$mutations.AA.from.codons, .$libraryID)) %>%
   ungroup()
 
 nbi_pair_mutations <- nbi_pair_mutations %>%
-  group_by(experiment,mutation_pair) %>%
+  rename(libraryID=experiment) %>%
+  group_by(libraryID,mutation_pair) %>%
   summarise(counts= n())
-save(nbi_pair_mutations, file="NBI_pair_mutations.Rdata")
+# save(nbi_pair_mutations, file="NBI_pair_mutations.Rdata")
 ```
 
-```{r}
-nbi_pair_mutations_stats <- read.table("data/NBI_PairMutations.txt", header=T) %>%
-  group_by(experiment) %>%
+```{r NBI stats pairs}
+nbi_pair_mutations_stats <-   nbi_pair_mutations %>% ungroup()%>%
+  group_by(libraryID) %>%
   summarise(n_different_pairs = n())
 
 nbi_pair_mutations_stats
@@ -650,38 +868,38 @@ nbi_pair_mutations_stats
 
 Mutations frequencies vs oligo
 
-```{r}
-mutations_position <- variantes_nbi_dna %>% 
-  filter(muts !="wrong length") %>% 
-  select(mutations.codons,experiment) %>% 
+```{r NBI oligos biases}
+mutations_position <- variants_nbi_dna %>% 
+  select(mutations.codons,libraryID) %>% 
   mutate(mutations.codons =str_split(mutations.codons,";"))%>%
-  unnest() %>%
+  unnest(cols = c(mutations.codons)) %>%
   filter(!is.na(mutations.codons))%>%
   mutate(pos = as.numeric(str_sub(mutations.codons,4,-4)), 
          start_codon = str_sub(mutations.codons,1,3),
          end_codon =str_sub(mutations.codons,-3))
 
 mutations_by_oligo <- mutations_position %>%
-  group_by(pos,experiment) %>%
+  group_by(pos,libraryID) %>%
   summarise(counts=n()) %>%
   left_join(opools_NBI) %>%
-  filter(!is.na(id))
+  filter(!is.na(id)) %>%
+  mutate(libraryID = factor(libraryID, levels=expIDs))
 ```
 
 Check if distributions are normal by Shapito test
 
-```{r}
+```{r NBI oligos biases2}
 mutations_by_oligo %>% 
-  group_by(experiment,start_oligo) %>% 
+  group_by(libraryID,start_oligo) %>% 
   summarise(pval=shapiro.test(counts)$p.value)  %>%
   mutate(signif = case_when(pval<0.001 ~ '***',pval<0.01~'**',pval<0.05~'*',pval>=0.05~'N.S.')) %>%
   select(-pval) %>%
-  pivot_wider(names_from= experiment,values_from = signif)
+  pivot_wider(names_from= libraryID,values_from = signif)
 ```
 
-```{r}
+```{r NBI oligos plot}
 ggplot(mutations_by_oligo, aes(sample = counts)) +
-  facet_grid(experiment~start_oligo,scales="free") + 
+  facet_grid(libraryID~start_oligo,scales="free") + 
   stat_qq() + 
   stat_qq_line()+
   ggtitle("NBI| Check normality")
@@ -691,20 +909,20 @@ ggplot(mutations_by_oligo, aes(sample = counts)) +
 
 Then use kruskal test to see if distributions are statistically different
 
-```{r}
-for(i in unique(mutations_by_oligo$experiment)){
+```{r NBI Krustal Test}
+for(i in unique(mutations_by_oligo$libraryID)){
  print(i)
-  print(kruskal.test(counts ~ start_oligo, data = mutations_by_oligo%>% filter(experiment ==i)))
+  print(kruskal.test(counts ~ start_oligo, data = mutations_by_oligo%>% filter(libraryID ==i)))
 }
 ```
 
 As all p-values are smaller than 0.05, I move to dunn test statistical differences in all combinations
-```{r Dunn Test 5p}
-exps <- unique(mutations_by_oligo$experiment)
+```{r NBI Dunn Test 5p}
+exps <- unique(mutations_by_oligo$libraryID)
 
 for(i in seq_along(exps)){
   DunnTest <- DunnTest(counts ~ start_oligo , 
-                       data = mutations_by_oligo %>% filter(experiment==exps[i]),
+                       data = mutations_by_oligo %>% filter(libraryID==exps[i]),
                        method = "bonferroni")
   DunnTest$pmat[lower.tri(DunnTest$pmat,diag = T)] <- NA
   dunn_test_df <- as.data.frame(as.table(DunnTest$pmat)) %>%
@@ -727,7 +945,7 @@ dunnTestDF <- dunnTestDF %>%
 mutations_by_oligo <- mutations_by_oligo%>%
   mutate(start_oligo = factor(start_oligo,levels=c("A","C","G","T")))
 
-mutations_by_oligo%>% group_by(experiment,start_oligo) %>%
+mutations_by_oligo%>% group_by(libraryID,start_oligo) %>%
   summarise(pval=shapiro.test(counts)$p.value) %>%
   mutate(is_normally_distr = pval>0.05)
 
@@ -737,31 +955,31 @@ Repeat for 3' base:  there is no significant differences
 
 Shapiro test to check normality
 
-```{r}
+```{r NBI stats oligos}
 mutations_by_oligo %>% 
-  group_by(experiment,end_oligo) %>% 
+  group_by(libraryID,end_oligo) %>% 
   summarise(pval=shapiro.test(counts)$p.value)  %>%
   mutate(signif = case_when(pval<0.001 ~ '***',pval<0.01~'**',pval<0.05~'*',pval>=0.05~'N.S.')) %>%
   select(-pval) %>%
-  pivot_wider(names_from= experiment,values_from = signif)
+  pivot_wider(names_from= libraryID,values_from = signif)
 ```
 
-```{r}
-for(i in unique(mutations_by_oligo$experiment)){
+```{r NBI stats oligos 2}
+for(i in unique(mutations_by_oligo$libraryID)){
  print(i)
-  print(kruskal.test(counts ~ end_oligo, data = mutations_by_oligo%>% filter(experiment ==i)))
+  print(kruskal.test(counts ~ end_oligo, data = mutations_by_oligo%>% filter(libraryID ==i)))
 }
 
 ```
 
 DunnTest for 3' end of oligos
 
-```{r}
-exps <- unique(mutations_by_oligo$experiment)
+```{r NBI stats oligos 3}
+exps <- unique(mutations_by_oligo$libraryID)
 
 for(i in seq_along(exps)){
   DunnTest <- DunnTest(counts ~ end_oligo , 
-                       data = mutations_by_oligo %>% filter(experiment==exps[i]),
+                       data = mutations_by_oligo %>% filter(libraryID==exps[i]),
                        method = "bonferroni")
   DunnTest$pmat[lower.tri(DunnTest$pmat,diag = T)] <- NA
   dunn_test_df <- as.data.frame(as.table(DunnTest$pmat)) %>%
@@ -784,18 +1002,19 @@ dunnTestDF_3prime <- dunnTestDF_3prime %>%
 dunnTestDF_3prime
 ```
 
+## FigS2
 They are all not significant
-
 ```{r FigureS biases}
-dunnTestDF$y_plot[dunnTestDF$signif!="N.S."] <- c(900,500,300,200,120,
-                                       900,600,400,
-                                       0.8,1.2,1.5,
-                                       0.8,1.2,1.5)
+dunnTestDF$y_plot[dunnTestDF$signif!="N.S."] <- c(10000,5000,3000,2000,
+                                       10000,5000,3000,2000,
+                                       10000,5000,5000,2000,
+                                       10000,5000,3000,2000)
+dunnTestDF <- dunnTestDF %>% rename(libraryID=experiment)
 plot_bias5 <- ggplot(mutations_by_oligo, aes(y=counts,x=start_oligo))+
   geom_boxplot(notch = TRUE)+
   geom_segment(data=dunnTestDF %>% filter(signif!="N.S."), aes(x=Var1,xend=Var2,y=y_plot),col=grey(.5))+
   geom_text(data=dunnTestDF %>% filter(signif!="N.S."), aes(x=x_plot,y=y_plot,label=signif),col=grey(.5))+
-  facet_wrap(~experiment,label=as_labeller(custom_labeller),nrow=1)+
+  facet_wrap(~libraryID,nrow=1)+
   scale_y_log10()+
   xlab("5' base in oligo")+
   ylab("Counts")+ scale_y_log10(guide = "axis_logticks")+
@@ -810,7 +1029,7 @@ plot_bias5 <- ggplot(mutations_by_oligo, aes(y=counts,x=start_oligo))+
 
 plot_bias3 <-ggplot(mutations_by_oligo, aes(y=counts,x=end_oligo))+
   geom_boxplot(notch = TRUE)+
-  facet_wrap(~experiment,label=as_labeller(custom_labeller),nrow=1)+
+  facet_wrap(~libraryID,nrow=1)+
   scale_y_log10()+
   xlab("3' base in oligo")+
   ylab("Counts")+ scale_y_log10(guide = "axis_logticks")+
@@ -821,27 +1040,25 @@ plot_bias3 <-ggplot(mutations_by_oligo, aes(y=counts,x=end_oligo))+
     legend.text = element_text(size = 8),  # legend labels
     legend.title = element_text(size = 8), # legend title
     plot.title = element_text(size = 8))
-```
-
-```{r}
 
 FigS2 <-    ggarrange(plotlist = list(plot_bias5,plot_bias3),ncol=1,labels = "AUTO")
 FigS2
+
 ```
 
 Figure 2C for main text
 ```{r Fig2c}
-exp_targ = 3
-dunnTestDF_targ <- dunnTestDF %>% filter(experiment==exp_targ) %>%
+exp_targ = "λ = 7.1"
+dunnTestDF_targ <- dunnTestDF %>% filter(libraryID==exp_targ) %>%
   filter(signif!="N.S.") %>%
-  mutate(y_plot=c(900,550,300))
-Fig2C<- ggplot(mutations_by_oligo %>% filter(experiment==3), aes(y=counts,x=start_oligo))+
+  mutate(y_plot=c(10000,5000,3000))
+Fig1D<- ggplot(mutations_by_oligo %>% filter(libraryID==exp_targ), aes(y=counts,x=start_oligo))+
   geom_boxplot(notch = TRUE)+
   geom_segment(data=dunnTestDF_targ ,
                aes(x=Var1,xend=Var2,y=y_plot))+
   geom_text(data=dunnTestDF_targ, 
             aes(x=x_plot,y=y_plot,label=signif))+
-  scale_y_log10(limits=c(NA,1200),guide = "axis_logticks")+
+  scale_y_log10(limits=c(NA,10000),guide = "axis_logticks")+
   xlab("5' base in oligo")+
   ylab("Counts")+ 
   theme_bw()+
@@ -855,22 +1072,46 @@ Fig2C<- ggplot(mutations_by_oligo %>% filter(experiment==3), aes(y=counts,x=star
     legend.title = element_text(size = 8), # legend title
     plot.title = element_text(size = 8),
     panel.border = element_rect(fill = NA, color = "black", size = 1))
+
+Fig1D
+```
+
+## Figure 1
+
+```{r Figure 1}
+library(png)
+require(grid)
+img <- readPNG("data/Fig1A_v4.png")
+
+Fig1A <- ggplot() +
+  annotation_custom(
+    rasterGrob(img, interpolate = TRUE),
+    xmin = -Inf, xmax = Inf,
+    ymin = -Inf, ymax = Inf
+  ) +
+  theme_void()+
+  theme(
+    plot.margin = margin(t = 1, r = 2, b = 0, l = 20)  
+  )
+
+
+Figure1 <- ggarrange(
+  Fig1A,
+            Fig1B,
+            ggarrange(
+              Fig1C+theme(margins = margin(l = 10, r=10)),
+              Fig1D+theme(axis.title.y = element_text(margin = margin(r = 10))),
+              ncol = 2, labels = c("C","D"), widths = c(1,0.4)),
+    nrow=3,labels = c("A","B",""), heights = c(.7,.7,.8))
+
+
+Figure1
+
+
  
-
 ```
 
-**Figure 2**
-
-```{r Figure 2}
-Figure2 <- ggarrange(Fig2A,
-          ggarrange(Fig2B, Fig2C, ncol = 2, labels = c("B", "C"), widths = c(3,1)),
-          nrow = 2,heights = c(1,1.5),
-          labels = "A"                                        # Labels of the scatter plot
-          ) 
-Figure2
-```
-
-
+## FigS3
 We also studied if there was dependency on the Tm of the oligos. We computed the Tm using NEB interface. 
 
 ```{r}
@@ -879,7 +1120,7 @@ tm_neb = read.table("data/tmcalc_batch_NEB.txt") %>%
   select(V2,V3) %>% dplyr::rename(spec_oligo=V2,Tm_NEB=V3)
 
 muts_tm <- mutations_position %>%
-  group_by(pos,experiment,start_codon, end_codon) %>%
+  group_by(pos,libraryID,start_codon, end_codon) %>%
   summarise(counts=n()) %>%
   left_join(opools_NBI) %>%
   filter(!is.na(id)) %>%
@@ -887,30 +1128,30 @@ muts_tm <- mutations_position %>%
   left_join(tm_neb,by=join_by("spec_oligo"))
 
 
-tm_neb_sum <- tm_neb %>% mutate(counts = 1,experiment="oPool") %>%
+tm_neb_sum <- tm_neb %>% mutate(counts = 1,libraryID="oPool") %>%
   rbind(
-  muts_tm %>% ungroup()%>% group_by(experiment) %>%
-    select(experiment,Tm_NEB,counts,spec_oligo)) %>%
+  muts_tm %>% ungroup()%>% group_by(libraryID) %>%
+    select(libraryID,Tm_NEB,counts,spec_oligo)) %>%
   mutate(start_base = str_sub(spec_oligo,1,1))%>%
-  group_by(Tm_NEB,experiment,start_base) %>%
+  group_by(Tm_NEB,libraryID,start_base) %>%
   summarise(counts_tm = sum(counts)) %>%
-  ungroup() %>% group_by(experiment,start_base) %>%
+  ungroup() %>% group_by(libraryID,start_base) %>%
   mutate(counts_tm = counts_tm/sum(counts_tm)*100) %>%
-  mutate(experiment = factor(experiment,levels=c("oPool","1","3","5","10"))) %>%
-  mutate(lw = ifelse(experiment=="oPool",'thin','not'))
+  mutate(libraryID = factor(libraryID,levels=c("oPool",expIDs))) %>%
+  mutate(lw = ifelse(libraryID=="oPool",'thin','not'))
 
 
-tm_neb_sum <- tm_neb %>% mutate(counts = 1,experiment="oPool") %>%
+tm_neb_sum <- tm_neb %>% mutate(counts = 1,libraryID="oPool") %>%
   rbind(
-  muts_tm %>% ungroup()%>% group_by(experiment) %>%
-    select(experiment,Tm_NEB,counts,spec_oligo)) %>%
+  muts_tm %>% ungroup()%>% group_by(libraryID) %>%
+    select(libraryID,Tm_NEB,counts,spec_oligo)) %>%
   mutate(start_base = str_sub(spec_oligo,1,1))%>%
-  group_by(Tm_NEB,experiment) %>%
+  group_by(Tm_NEB,libraryID) %>%
   summarise(counts_tm = sum(counts)) %>%
-  ungroup() %>% group_by(experiment) %>%
+  ungroup() %>% group_by(libraryID) %>%
   mutate(counts_tm = counts_tm/sum(counts_tm)*100) %>%
-  mutate(experiment = factor(experiment,levels=c("oPool","1","3","5","10"))) %>%
-  mutate(Sample = ifelse(experiment=="oPool",'oPool','Libraries')) %>%
+  mutate(libraryID = factor(libraryID,levels=c("oPool",expIDs))) %>%
+  mutate(Sample = ifelse(libraryID=="oPool",'oPool','Libraries')) %>%
   group_by(Sample,Tm_NEB) %>%
   summarise(counts_av = mean(counts_tm), counts_sd = sd(counts_tm),counts_min=min(counts_tm),counts_max = max(counts_tm))%>%
   mutate(lw = ifelse(Sample=="oPool",'thin','not'))
@@ -937,16 +1178,13 @@ FigS3 <- ggplot(data = tm_neb_sum,aes(col=Sample))+
     plot.title = element_text(size = 8))
 
 FigS3
-
 ```
 
 
 
-
+## FigS9
 ```{r}
-##--------------------------------##
-## Analysis for NBI
-##--------------------------------##
+
 round_to_se <- function(estimate, se, digits = 1) {
   dec <- floor(log10(se))
   se_rounded <- signif(se, digits)
@@ -973,11 +1211,12 @@ df <- df %>%
 
 df <- df %>%   filter(well %in% c("D4","D6","D8","E5"))%>%
   mutate(well = recode(well,
-                       "D4" = "oPool to template ratio:1",
-                       "D6" = "oPool to template ratio:3",
-                       "D8" = "oPool to template ratio:5",
-                       "E5" = "oPool to template ratio:10"
-  ))
+                       "D4" = expIDs[1],#"oPool to template ratio:1",
+                       "D6" = expIDs[2],#"oPool to template ratio:3",
+                       "D8" = expIDs[3],#"oPool to template ratio:5",
+                       "E5" = expIDs[4]#"oPool to template ratio:10"
+  )) %>%
+  mutate(well=factor(well, levels=expIDs))
 
 fits <- df %>%
   group_by(well) %>%
@@ -1020,11 +1259,9 @@ fit_data <- data.frame(Cycle=seq(0,20)) %>%
   mutate(y=fits$a[3]*fits$n[3]^Cycle+fits$b[3], well=fits$well[3])) %>%
   rbind(data.frame(Cycle=seq(0,20)) %>%
   mutate(y=fits$a[4]*fits$n[4]^Cycle+fits$b[4], well=fits$well[4]))
-  
-colors_exp <- c("red","darkgreen","blue","orange") 
-names(colors_exp) <- c( "oPool to template ratio:1" , "oPool to template ratio:3" , "oPool to template ratio:5" , "oPool to template ratio:10")
 
-FigS8 <- ggplot(df, aes(x=Cycle,y=int0,col=well))+
+
+FigS9 <- ggplot(df, aes(x=Cycle,y=int0,col=well))+
   geom_point()+geom_line()+
   geom_line(data=fit_data, aes(x=Cycle,y=y),col='red')+
   scale_color_manual(values = colors_exp)+
@@ -1041,7 +1278,7 @@ FigS8 <- ggplot(df, aes(x=Cycle,y=int0,col=well))+
         plot.title = element_text(size = 10))
 
 
-FigS8
+FigS9
 
 ```
 
@@ -1165,7 +1402,7 @@ results_fitPoisson_gfp_data <-
 
 
 
-Fig3a <- ggplot(results_fitPoisson_gfp_data , aes(x = n_mutated_codons)) +
+Fig2b <- ggplot(results_fitPoisson_gfp_data , aes(x = n_mutated_codons)) +
     geom_bar(aes(y = proportion,fill = fill_bar), stat = "identity", alpha = 0.5, width = 0.8) +
     scale_fill_manual(values = c("highlight" = "lightcoral", "normal" = "grey50")) +
     geom_line(aes(y = predicted),color='black')+
@@ -1182,10 +1419,10 @@ Fig3a <- ggplot(results_fitPoisson_gfp_data , aes(x = n_mutated_codons)) +
       legend.title = element_text(size = 8), # legend title
       plot.title = element_text(size = 8)) +   # plot title)+
      facet_wrap(~experiment,nrow=1, labeller= label_wrap_gen(width = 15) )+
-    geom_text(data = lambda_estimates_df,aes(x=10,y=0.23,label = label),parse=F, size = 7, size.unit = "pt")+
+    geom_text(data = lambda_estimates_df,aes(x=10,y=0.23,label = label),parse=F, size = 12, size.unit = "pt")+
     scale_y_continuous(breaks = c(0,0.1,0.2,0.3),limits = c(0,0.25))
 
-Fig3a 
+Fig2b 
 ```
 
 Look at results (pval<0.05 rejects poisson distribution)
@@ -1203,7 +1440,7 @@ cat("\ndsDNA removing wild type. X2=",fit$chisq_value,"and p-value=", fit$pval_c
 ```
 
 
-
+## FigS7
 ```{r}
 
 mutations_position_counts <- variantes_gfp_dna %>% 
@@ -1217,12 +1454,14 @@ mutations_position_counts <- variantes_gfp_dna %>%
   filter(!is.na(mutations.codons) ) %>%
   mutate(aminoacid=plyr::mapvalues(codon_mut, from=names(codon_to_aa), to=codon_to_aa)) %>%
   group_by(experiment, pos, aminoacid) %>%
-  summarise(counts_variants = n()) 
+  summarise(counts_variants = n())  %>%
+  filter(counts_variants>9 | paste0(pos, aminoacid)%in%paste0(opools_GFP$pos_codon,opools_GFP$aminoacid)) 
+
 paux <- sort(unique(mutations_position_counts$pos))
 opools_GFP <- opools_GFP %>% mutate(pos_plot = factor(pos_codon, levels=paux))
 mutations_position_counts <- mutations_position_counts %>% mutate(pos=factor(pos,level=paux))
 
-FigS6 <- ggplot(mutations_position_counts,aes(x=pos,y=aminoacid, fill=counts_variants))+
+FigS7 <- ggplot(mutations_position_counts,aes(x=pos,y=aminoacid, fill=counts_variants))+
   geom_tile()+
   facet_grid(rows=vars(experiment))+
   scale_fill_continuous(type = "viridis", name="Counts",    trans = "log10",
@@ -1233,7 +1472,6 @@ FigS6 <- ggplot(mutations_position_counts,aes(x=pos,y=aminoacid, fill=counts_var
   xlab("Position")+ylab("Amino acid")+
   theme_bw()+
   theme(axis.text.x = element_text(angle=90,hjust = 1,vjust=0.5),
-        
     legend.position = "left",
     text = element_text(size = 14),         # overall text
     axis.title = element_text(size = 12),   # axis labels
@@ -1241,7 +1479,7 @@ FigS6 <- ggplot(mutations_position_counts,aes(x=pos,y=aminoacid, fill=counts_var
     legend.text = element_text(size = 8),  # legend labels
     legend.title = element_text(size = 12), # legend title
     plot.title = element_text(size = 14),strip.text = element_text(size = 10))
-FigS6
+FigS7
 
 ```
 
@@ -1259,7 +1497,7 @@ empty_diag_with_axes <- function(data, mapping, ...) {
 }
 
 
-FigS7 <- GGally::ggpairs(
+FigS8 <- GGally::ggpairs(
   progress = FALSE,
   data = gfp_muts_comp , 
   upper = list(continuous = GGally::wrap("smooth", method = "lm", se = FALSE)),
@@ -1278,7 +1516,8 @@ FigS7 <- GGally::ggpairs(
     plot.title = element_text(size = 8))
 
 
-FigS7
+FigS8
+
 ```
 
 
@@ -1299,24 +1538,31 @@ variantes_gfp_dna %>%
 ## Activity
 
 ```{r GFP activity}
-act_biot <- flowCore::read.FCS("data/Attune_SPABeads.fcs",emptyValue = F, transformation=FALSE)
-act_ds <- flowCore::read.FCS("data/Attune_dsDNA.fcs",emptyValue = F, transformation=FALSE)
-act_gel <- flowCore::read.FCS("data/Attune_SPAGel.fcs",emptyValue = F, transformation=FALSE)
-act_lambda <- flowCore::read.FCS("data/Attue_LambdaExo.fcs",emptyValue = F, transformation=FALSE)
-act_wt <- flowCore::read.FCS("data/Attune_Wildtype.fcs",emptyValue = F, transformation=FALSE)
-act_nc <- flowCore::read.FCS("data/Attune_NegativeControl.fcs",emptyValue = F, transformation=FALSE)
 
-
-df_act <- as.data.frame(flowCore::exprs(act_biot)) %>% mutate(experiment="SPA + Beads purification")%>% 
-        rbind( as.data.frame(flowCore::exprs(act_ds)) %>% mutate(experiment="dsDNA"))%>%
-        rbind( as.data.frame(flowCore::exprs(act_gel)) %>% mutate(experiment="SPA + Gel purification"))%>%
-        rbind( as.data.frame(flowCore::exprs(act_lambda)) %>% mutate(experiment="λ-exonuclease degradation"))%>%
-        rbind( as.data.frame(flowCore::exprs(act_wt)) %>% mutate(experiment="Wild type"))%>%
-        rbind( as.data.frame(flowCore::exprs(act_nc)) %>% mutate(experiment="Negative control"))
-
-rm(act_biot,act_ds,act_gel,act_lambda,act_wt,act_nc)
-gc(reset = T)
-
+#In FALSE, the original data analysis. A reduced version of the data is provided to accelerate the execution time
+if(FALSE){
+  act_biot <- flowCore::read.FCS("data/Attune_SPABeads.fcs",emptyValue = F, transformation=FALSE)
+  act_ds <- flowCore::read.FCS("data/Attune_dsDNA.fcs",emptyValue = F, transformation=FALSE)
+  act_gel <- flowCore::read.FCS("data/Attune_SPAGel.fcs",emptyValue = F, transformation=FALSE)
+  act_lambda <- flowCore::read.FCS("data/Attue_LambdaExo.fcs",emptyValue = F, transformation=FALSE)
+  act_wt <- flowCore::read.FCS("data/Attune_Wildtype.fcs",emptyValue = F, transformation=FALSE)
+  act_nc <- flowCore::read.FCS("data/Attune_NegativeControl.fcs",emptyValue = F, transformation=FALSE)
+  
+  
+  df_act <- as.data.frame(flowCore::exprs(act_biot)) %>% mutate(experiment="SPA + Beads purification")%>% 
+          rbind( as.data.frame(flowCore::exprs(act_ds)) %>% mutate(experiment="dsDNA"))%>%
+          rbind( as.data.frame(flowCore::exprs(act_gel)) %>% mutate(experiment="SPA + Gel purification"))%>%
+          rbind( as.data.frame(flowCore::exprs(act_lambda)) %>% mutate(experiment="λ-exonuclease degradation"))%>%
+          rbind( as.data.frame(flowCore::exprs(act_wt)) %>% mutate(experiment="Wild type"))%>%
+          rbind( as.data.frame(flowCore::exprs(act_nc)) %>% mutate(experiment="Negative control"))
+  df_act <- df_act %>% select(experiment,`BL1-A`,`FSC-A`,`SSC-A`)
+  rm(act_biot,act_ds,act_gel,act_lambda,act_wt,act_nc)
+  gc(reset = T)
+  write.table(df_act,"data/Attune_data.txt")
+}else{
+  print("Please untar Attune_data.tar.xz")
+  df_act <- read.table("data/Attune_data.txt")
+}
 
 
 mu_x <- log10(38000)
@@ -1328,7 +1574,9 @@ df_act <- df_act %>%
   filter(keep) %>%
   select(experiment,`BL1-A`) %>% 
   dplyr::rename(gfp_signal=`BL1-A`) %>%
-  mutate(exp=experiment)
+  mutate(exp=experiment)%>%
+  mutate(experiment=factor(experiment,levels=c("λ-exonuclease degradation","SPA + Beads purification",
+                                               "SPA + Gel purification","dsDNA","Wild type","Negative control")))
 
 ```
 
@@ -1375,7 +1623,7 @@ line_types <- c(
 )
 
 
-Fig3A_act <- ggplot(plot_data, aes(x = gfp_signal, color = exp)) +
+Fig2b_act <- ggplot(plot_data, aes(x = gfp_signal, color = exp)) +
   scale_x_log10(
       labels = trans_format("log10", math_format(10^.x)),
       minor_breaks = c(10^1,10^3,10^5)
@@ -1410,7 +1658,7 @@ Fig3A_act <- ggplot(plot_data, aes(x = gfp_signal, color = exp)) +
     strip.background = element_blank()  # remove gray background
   )
 
-Fig3A_act
+Fig2b_act
 ```
 
 
@@ -1430,8 +1678,7 @@ bst_orf <- str_sub(bst_amplicon,orf_ini,orf_end)
 bst_orf_str <- bst_amplicon_str[orf_ini:orf_end]
 orf_length = length(bst_orf_str)
 amplicon_length<- length(bst_amplicon_str)
-load("../Bst_variants.Rdata")->a
-bst_variants <- read.table("data/BST_variants.txt", heade=T)
+bst_variants <- read.table("data/BST_variants.txt", header=T)
 oligo_list <- read.csv("data/BST_oligos.txt")
 targeted_mutations <- data.frame(mutation=c("T394C","T394H","R396H","R396Y","Q485H",
                                             "F491H","F491Y","G492C","G492H","Y495H","S566C","F567Y",
@@ -1541,7 +1788,7 @@ doubleLib_closeMut <- bst_variants %>%
 
 
 ```{r}
-Fig3B <- ggplot(df.bst, aes(x=mut1, y=mut2, fill=targeted))+
+Fig2C <- ggplot(df.bst, aes(x=mut1, y=mut2, fill=targeted))+
   geom_tile()+
   geom_tile(aes(x=mut2,y=mut1))+
   scale_x_discrete(drop = FALSE) +
@@ -1596,20 +1843,55 @@ Fig3B <- ggplot(df.bst, aes(x=mut1, y=mut2, fill=targeted))+
   geom_point(inherit.aes = F,data=doubleLib_closeMut, aes(x=mut1,y=mut2,col=experiment,shape=experiment))
 
 
-Fig3B
+Fig2C
 ```
 
-**Figure 3**
+## Figure 2
 ```{r}
-Fig3 <- ggarrange(
-  ggarrange(Fig3a+ggtitle("Mutations")+theme(plot.title = element_text(face = "bold")),
-           Fig3A_act+theme(plot.margin = margin(l=.025,r=0.01,unit = "npc"),
-                           plot.title = element_text(face = "bold")),
-            ncol=1,heights = c(1.3,1)*0.5), 
-  Fig3B + theme(legend.position.inside = c(0.26,0.78),   legend.spacing.y = unit(0.4, "cm"),legend.title.margin = margin(b = 0)), 
-  ncol = 2,labels = "AUTO", widths = c(1,0.65), heights = c(1,1))
+library(png)
+require(grid)
+img <- readPNG("data/Figure_ssDNA_v2.png")
 
-Fig3
+FigImage <- ggplot() +
+  annotation_custom(
+    rasterGrob(img, interpolate = TRUE),
+    xmin = -Inf, xmax = Inf,
+    ymin = -Inf, ymax = Inf
+  ) +
+  theme_void()+
+  theme(
+    plot.margin = margin(t = 5, r = 10, b = 5, l = 15)  # ← add left margin
+  )
+
+
+Fig2 <- ggarrange(
+  FigImage,
+  ggarrange(
+    ggarrange(Fig2b+ggtitle("Mutations")+
+                theme(text=element_text(size=16),
+                      axis.title = element_text(size=14),
+                      plot.title = element_text(face = "bold", size=16),
+                      legend.text = element_text(size=12)),
+             Fig2b_act+theme(plot.margin = margin(l=.025,r=0.01,unit = "npc"),
+                             axis.title = element_text(size=14),
+                             plot.title = element_text(face = "bold", size=16),
+                      legend.text = element_text(size=12),
+                      legend.title =  element_text(size=12)),
+              ncol=1,heights = c(1.3,1)*0.5), 
+    Fig2C + geom_abline(aes(intercept=0,slope=1), lwd=2, col=grey(.6))+
+      theme(legend.position.inside = c(0.265,0.85),  
+              legend.spacing.y = unit(0.3, "cm"),
+              legend.title.margin = margin(b = 0),
+               axis.title = element_text(size=14)), 
+    ncol = 2,labels = c("B","C"), widths = c(1,0.8), heights = c(.9,1)), 
+  nrow=2, labels=c("A",""), heights = c(.8,1))
+
+Fig2
+
+
+
+
+
 ```
 
 Variants with double mutants in the Single library
@@ -1647,7 +1929,7 @@ fisher.test(fisher_mat)
 
 What are the chances of getting the Single Mut. distribution by subsampling the Single+Double mut. results?
 Test by subsampling:
-```{r Test Size}
+```{r Test Size, eval=F}
 sample_size <- 142
 for(i in 1:10000){
   #Take a smaller set of the Mix oPool (the size of the single oPool)
@@ -1685,7 +1967,7 @@ for(i in 1:10000){
 
 How many times we obtain less than 3 double mutants?  
 None. So prob is less than 0.001
-```{r}
+```{r, eval=F}
 res_bootstraping%>% 
   filter(muttype=="double") %>%
   filter(n_mutants<=3) 
